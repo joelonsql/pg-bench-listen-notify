@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
+use libc::{rlimit, RLIMIT_NOFILE};
 use csv::Writer;
 use std::collections::VecDeque;
-use std::fs::File;
-use std::path::PathBuf;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,28 +24,81 @@ struct Measurement {
 #[derive(Debug)]
 struct Stats {
     min: f64,
+    q1: f64,     // First quartile (25th percentile)
+    median: f64, // Second quartile (50th percentile)
+    q3: f64,     // Third quartile (75th percentile)
     max: f64,
     avg: f64,
     stddev: f64,
 }
 
 fn calculate_stats(measurements: &[Measurement]) -> Stats {
-    let values: Vec<f64> = measurements
+    let mut values: Vec<f64> = measurements
         .iter()
         .map(|m| m.round_trip_ns as f64 / 1_000_000.0) // Convert to milliseconds
         .collect();
 
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let avg = values.iter().sum::<f64>() / values.len() as f64;
+    // Sort values for percentile calculations
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let variance = values
+    // Calculate initial quartiles for outlier detection
+    let initial_q1 = percentile(&values, 0.25);
+    let initial_q3 = percentile(&values, 0.75);
+    let iqr = initial_q3 - initial_q1;
+    
+    // Define outlier boundaries (1.5 * IQR is standard)
+    let lower_bound = initial_q1 - 1.5 * iqr;
+    let upper_bound = initial_q3 + 1.5 * iqr;
+    
+    // Filter out outliers
+    let filtered_values: Vec<f64> = values
+        .iter()
+        .cloned()
+        .filter(|&x| x >= lower_bound && x <= upper_bound)
+        .collect();
+    
+    // If too many values were filtered out, use original values
+    let working_values = if filtered_values.len() < values.len() / 2 {
+        &values
+    } else {
+        &filtered_values
+    };
+
+    let len = working_values.len();
+    let min = working_values[0];
+    let max = working_values[len - 1];
+    let avg = working_values.iter().sum::<f64>() / len as f64;
+
+    // Calculate quartiles on filtered data
+    let q1 = percentile(working_values, 0.25);
+    let median = percentile(working_values, 0.50);
+    let q3 = percentile(working_values, 0.75);
+
+    let variance = working_values
         .iter()
         .map(|&x| (x - avg).powi(2))
-        .sum::<f64>() / values.len() as f64;
+        .sum::<f64>() / len as f64;
     let stddev = variance.sqrt();
 
-    Stats { min, max, avg, stddev }
+    Stats { min, q1, median, q3, max, avg, stddev }
+}
+
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    let len = sorted_values.len();
+    if len == 0 {
+        return 0.0;
+    }
+    
+    let index = percentile * (len - 1) as f64;
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    
+    if lower == upper {
+        sorted_values[lower]
+    } else {
+        let weight = index - lower as f64;
+        sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+    }
 }
 
 async fn find_free_port() -> Result<u16> {
@@ -57,13 +110,28 @@ async fn find_free_port() -> Result<u16> {
     anyhow::bail!("No free port found")
 }
 
-async fn setup_postgres() -> Result<(TempDir, u16, String)> {
+async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, String, String)> {
+    // Build command paths
+    let (initdb_cmd, pg_ctl_cmd, createdb_cmd) = if let Some(bin_path) = pg_bin_path {
+        (
+            bin_path.join("initdb"),
+            bin_path.join("pg_ctl"),
+            bin_path.join("createdb"),
+        )
+    } else {
+        (
+            PathBuf::from("initdb"),
+            PathBuf::from("pg_ctl"),
+            PathBuf::from("createdb"),
+        )
+    };
+    
     // Check for PostgreSQL tools
-    for tool in &["initdb", "pg_ctl", "createdb"] {
-        Command::new(tool)
+    for (tool_name, tool_path) in &[("initdb", &initdb_cmd), ("pg_ctl", &pg_ctl_cmd), ("createdb", &createdb_cmd)] {
+        Command::new(tool_path)
             .arg("--version")
             .output()
-            .with_context(|| format!("{} not found in PATH", tool))?;
+            .with_context(|| format!("{} not found at {:?}", tool_name, tool_path))?;
     }
 
     let temp_dir = TempDir::new()?;
@@ -71,7 +139,7 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
     let port = find_free_port().await?;
 
     // Initialize database
-    let output = Command::new("initdb")
+    let output = Command::new(&initdb_cmd)
         .arg("-D")
         .arg(&data_dir)
         .arg("--auth=trust")
@@ -84,7 +152,7 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
 
 
     // Start PostgreSQL
-    let output = Command::new("pg_ctl")
+    let output = Command::new(&pg_ctl_cmd)
         .arg("-D")
         .arg(&data_dir)
         .arg("-l")
@@ -104,7 +172,7 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
 
     // Create test database
     println!("Creating test database...");
-    let output = Command::new("createdb")
+    let output = Command::new(&createdb_cmd)
         .arg("-p")
         .arg(port.to_string())
         .arg("testdb")
@@ -132,7 +200,7 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
                 // Set multiple parameters for high connection count
                 // With 128GB RAM, use 25% (32GB) for shared_buffers
                 let settings = vec![
-                    "ALTER SYSTEM SET max_connections = 10100",
+                    "ALTER SYSTEM SET max_connections = 2000",
                     "ALTER SYSTEM SET shared_buffers = '32GB'",
                     "ALTER SYSTEM SET work_mem = '1MB'",
                     "ALTER SYSTEM SET maintenance_work_mem = '256MB'",
@@ -167,7 +235,7 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
 
     // Stop PostgreSQL
     println!("Stopping PostgreSQL...");
-    let output = Command::new("pg_ctl")
+    let output = Command::new(&pg_ctl_cmd)
         .arg("-D")
         .arg(&data_dir)
         .arg("-m")
@@ -184,7 +252,7 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
 
     // Start PostgreSQL again with new settings
     println!("Starting PostgreSQL with new settings...");
-    let output = Command::new("pg_ctl")
+    let output = Command::new(&pg_ctl_cmd)
         .arg("-D")
         .arg(&data_dir)
         .arg("-l")
@@ -203,11 +271,30 @@ async fn setup_postgres() -> Result<(TempDir, u16, String)> {
     sleep(Duration::from_secs(3)).await;
 
     let connection_string = format!("host=127.0.0.1 port={} dbname=testdb user={}", port, whoami::username());
-    Ok((temp_dir, port, connection_string))
+    
+    // Get PostgreSQL version
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Version check connection error: {}", e);
+        }
+    });
+    
+    let row = client.query_one("SELECT version()", &[]).await?;
+    let version: String = row.get(0);
+    println!("PostgreSQL version: {}", version);
+    
+    Ok((temp_dir, port, connection_string, version))
 }
 
-async fn cleanup_postgres(data_dir: &PathBuf, _port: u16) -> Result<()> {
-    let output = Command::new("pg_ctl")
+async fn cleanup_postgres(data_dir: &PathBuf, _port: u16, pg_bin_path: Option<&Path>) -> Result<()> {
+    let pg_ctl_cmd = if let Some(bin_path) = pg_bin_path {
+        bin_path.join("pg_ctl")
+    } else {
+        PathBuf::from("pg_ctl")
+    };
+    
+    let output = Command::new(&pg_ctl_cmd)
         .arg("-D")
         .arg(data_dir)
         .arg("-m")
@@ -348,6 +435,24 @@ async fn create_idle_listener(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    let pg_bin_path = if args.len() > 1 {
+        Some(Path::new(&args[1]))
+    } else {
+        None
+    };
+    
+    let output_file = if args.len() > 2 {
+        &args[2]
+    } else {
+        "stats.csv"
+    };
+    
+    if let Some(path) = pg_bin_path {
+        println!("Using PostgreSQL binaries from: {:?}", path);
+    }
+    
     // Check and increase OS limits
     println!("Checking and adjusting OS limits...");
     
@@ -361,8 +466,8 @@ async fn main() -> Result<()> {
         if libc::getrlimit(RLIMIT_NOFILE, &mut rlim) == 0 {
             println!("Current file descriptor limit: soft={}, hard={}", rlim.rlim_cur, rlim.rlim_max);
             
-            // Try to set to a high value (20000 should be enough for 10000 connections)
-            let new_limit = 20000;
+            // Try to set to a high value (3000 should be enough for 1000 connections)
+            let new_limit = 3000;
             rlim.rlim_cur = new_limit;
             if rlim.rlim_max < new_limit {
                 rlim.rlim_max = new_limit;
@@ -388,7 +493,7 @@ async fn main() -> Result<()> {
     }
     
     println!("Setting up PostgreSQL...");
-    let (temp_dir, port, connection_string) = setup_postgres().await?;
+    let (temp_dir, port, connection_string, pg_version) = setup_postgres(pg_bin_path).await?;
     let data_dir = temp_dir.path().join("data");
 
     println!("PostgreSQL started on port {}", port);
@@ -416,10 +521,21 @@ async fn main() -> Result<()> {
     let shared_buffers: &str = row.get(0);
     println!("PostgreSQL shared_buffers: {}", shared_buffers);
 
-    // Create CSV writer
-    let file = File::create("stats.csv")?;
+    // Create or append to CSV file
+    let file_exists = std::path::Path::new(output_file).exists();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_file)?;
     let mut csv_writer = Writer::from_writer(file);
-    csv_writer.write_record(&["connections", "min_ms", "avg_ms", "max_ms", "stddev_ms"])?;
+    
+    // Write header only if file is new
+    if !file_exists {
+        csv_writer.write_record(&[
+            "connections", "min_ms", "q1_ms", "median_ms", "q3_ms", "max_ms", 
+            "avg_ms", "stddev_ms", "version"
+        ])?;
+    }
 
     // Create channels for measurements
     let (tx, mut rx) = mpsc::channel::<Measurement>(1000);
@@ -472,18 +588,33 @@ async fn main() -> Result<()> {
 
                 let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
                 
+                // Count outliers for information
+                let raw_values: Vec<f64> = recent.iter()
+                    .map(|m| m.round_trip_ns as f64 / 1_000_000.0)
+                    .collect();
+                let initial_q1 = percentile(&{let mut v = raw_values.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v}, 0.25);
+                let initial_q3 = percentile(&{let mut v = raw_values.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v}, 0.75);
+                let iqr = initial_q3 - initial_q1;
+                let outliers = raw_values.iter()
+                    .filter(|&&x| x < initial_q1 - 1.5 * iqr || x > initial_q3 + 1.5 * iqr)
+                    .count();
+                
                 println!(
-                    "Connections: {:5}, Min: {:7.2}ms, Avg: {:7.2}ms, Max: {:7.2}ms, StdDev: {:7.2}ms",
-                    connection_count, stats.min, stats.avg, stats.max, stats.stddev
+                    "Connections: {:5}, Min: {:7.2}ms, Q1: {:7.2}ms, Median: {:7.2}ms, Q3: {:7.2}ms, Max: {:7.2}ms (outliers: {})",
+                    connection_count, stats.min, stats.q1, stats.median, stats.q3, stats.max, outliers
                 );
 
                 // Write to CSV
                 csv_writer.write_record(&[
                     connection_count.to_string(),
                     format!("{:.2}", stats.min),
-                    format!("{:.2}", stats.avg),
+                    format!("{:.2}", stats.q1),
+                    format!("{:.2}", stats.median),
+                    format!("{:.2}", stats.q3),
                     format!("{:.2}", stats.max),
+                    format!("{:.2}", stats.avg),
                     format!("{:.2}", stats.stddev),
+                    pg_version.clone(),
                 ])?;
                 csv_writer.flush()?;
 
@@ -500,9 +631,9 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Switch to decreasing phase after reaching 10000
-                    if idle_threads.len() >= 10000 {
-                        println!("Reached 10000 idle connections, now decreasing...");
+                    // Switch to decreasing phase after reaching 1000
+                    if idle_threads.len() >= 1000 {
+                        println!("Reached 1000 idle connections, now decreasing...");
                         phase = "decreasing";
                     }
                 } else if phase == "decreasing" {
@@ -525,7 +656,7 @@ async fn main() -> Result<()> {
 
     // Cleanup
     println!("Cleaning up...");
-    cleanup_postgres(&data_dir, port).await?;
+    cleanup_postgres(&data_dir, port, pg_bin_path).await?;
 
     Ok(())
 }

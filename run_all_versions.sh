@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# Script to run benchmarks for all PostgreSQL versions
+
+echo "Building the benchmark tool..."
+cargo build --release
+
+# Single output file for all versions
+OUTPUT_FILE="benchmark_results.csv"
+
+# Remove old results file if it exists
+if [ -f "$OUTPUT_FILE" ]; then
+    echo "Removing old results file: $OUTPUT_FILE"
+    rm "$OUTPUT_FILE"
+fi
+
+# Define PostgreSQL versions and paths
+declare -a PG_PATHS=(
+    "/Applications/Postgres.app/Contents/Versions/13/bin"
+    "/Applications/Postgres.app/Contents/Versions/14/bin"
+    "/Applications/Postgres.app/Contents/Versions/15/bin"
+    "/Applications/Postgres.app/Contents/Versions/16/bin"
+    "/Applications/Postgres.app/Contents/Versions/17/bin"
+    "$HOME/pg-dev/bin"
+)
+
+# Run benchmark for each version
+for pg_path in "${PG_PATHS[@]}"; do
+    if [ -d "$pg_path" ]; then
+        echo ""
+        echo "=========================================="
+        echo "Testing PostgreSQL at: $pg_path"
+        echo "=========================================="
+        
+        # Run the benchmark - all versions append to the same file
+        ./target/release/pg-bench-listen-notify "$pg_path" "$OUTPUT_FILE"
+        
+        if [ $? -eq 0 ]; then
+            echo "✅ Benchmark completed for $pg_path"
+        else
+            echo "❌ Benchmark failed for $pg_path"
+        fi
+    else
+        echo "⚠️  Skipping $pg_path (directory not found)"
+    fi
+done
+
+echo ""
+echo "All benchmarks completed!"
+echo "Results saved in: $OUTPUT_FILE"
