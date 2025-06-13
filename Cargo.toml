@@ -1,0 +1,16 @@
+[package]
+name = "pg-bench-listen-notify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+futures-util = "0.3"
+tempfile = "3"
+port_scanner = "0.1"
+csv = "1"
+anyhow = "1"
+chrono = "0.4"
+whoami = "1"
+libc = "0.2"
