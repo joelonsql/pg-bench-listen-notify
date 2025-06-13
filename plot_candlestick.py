@@ -90,16 +90,25 @@ def plot_candlestick_comparison(csv_file='benchmark_results.csv', output_file='c
             ax_plot.plot([x - width*0.3/n_versions, x + width*0.3/n_versions], 
                         [median, median], color='black', linewidth=2)
         
-        # Linear regression on medians
-        slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(
-            increasing_df['connections'], 
-            increasing_df['median_ms']
-        )
+        # Linear regression on medians for 100-1000 connections only
+        regression_df = increasing_df[
+            (increasing_df['connections'] >= 100) & 
+            (increasing_df['connections'] <= 1000)
+        ]
         
-        # Plot regression line
-        x_reg = np.array([increasing_df['connections'].min(), increasing_df['connections'].max()])
-        y_reg = slope * x_reg + intercept
-        ax_plot.plot(x_reg, y_reg, color=color, linewidth=2, alpha=0.8, linestyle='--')
+        if len(regression_df) > 1:
+            slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(
+                regression_df['connections'], 
+                regression_df['median_ms']
+            )
+            
+            # Plot regression line across the full range, but computed only from 100-1000
+            x_reg = np.array([increasing_df['connections'].min(), increasing_df['connections'].max()])
+            y_reg = slope * x_reg + intercept
+            ax_plot.plot(x_reg, y_reg, color=color, linewidth=2, alpha=0.8, linestyle='--')
+        else:
+            # Fallback if not enough data points in range
+            slope, intercept, r_value = 0, 0, 0
         
         # Create legend entry with regression formula
         slope_us = slope * 1000  # Convert ms to μs
@@ -129,7 +138,7 @@ def plot_candlestick_comparison(csv_file='benchmark_results.csv', output_file='c
     ax_plot.grid(True, alpha=0.3, linestyle='--', zorder=1)
     
     # Add explanation text
-    ax_plot.text(0.02, 0.98, 'Box: Q1-Q3, Black line: Median, Whiskers: Min-Max',
+    ax_plot.text(0.02, 0.98, 'Box: Q1-Q3, Black line: Median, Whiskers: Min-Max\nRegression computed from 100-1000 connections only',
                 transform=ax_plot.transAxes, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
                 fontsize=9)
@@ -144,7 +153,7 @@ def plot_candlestick_comparison(csv_file='benchmark_results.csv', output_file='c
                             frameon=True,
                             fancybox=True,
                             shadow=True,
-                            title='PostgreSQL Version and Linear Regression Formula (based on median)',
+                            title='PostgreSQL Version and Linear Regression Formula (100-1000 connections)',
                             title_fontsize=11)
     
     legend.get_frame().set_alpha(0.9)
@@ -154,7 +163,7 @@ def plot_candlestick_comparison(csv_file='benchmark_results.csv', output_file='c
     print(f"Plot saved to {output_file}")
     
     # Print summary statistics with regression info
-    print("\nLinear Regression Summary (based on median latency):")
+    print("\nLinear Regression Summary (100-1000 connections):")
     print("-" * 100)
     print(f"{'Version':<50} {'Slope (μs/conn)':<15} {'Intercept (ms)':<15} {'R²':<10}")
     print("-" * 100)
