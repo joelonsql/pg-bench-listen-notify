@@ -11,6 +11,11 @@ A benchmarking tool that measures how PostgreSQL LISTEN/NOTIFY performance scale
 ### Overall Comparison
 ![Benchmark Results](candlestick_comparison.png)
 
+The chart shows three panels with different connection ranges to provide clear visualization:
+- **0-10 connections**: All data points shown for detailed view of low connection counts
+- **10-100 connections**: Every 10th connection shown (10, 20, 30, ..., 100)
+- **100-1000 connections**: Every 100th connection shown (100, 200, 300, ..., 1000) with linear regression analysis
+
 ### Scaling Analysis: O(N) vs O(1) Behavior
 
 Our analysis reveals that PostgreSQL LISTEN/NOTIFY exhibits **O(N) scaling** for all standard versions, where N is the number of listening connections. Only the optimization patch achieves true **O(1) constant-time** performance.
@@ -236,13 +241,21 @@ python3 analyze_scaling.py benchmark_results.csv
 
 ## Understanding the Chart
 
-The candlestick chart visualizes latency distribution:
+The candlestick chart visualizes latency distribution across three panels:
+
+**Chart Elements**:
 - **Box**: Interquartile range (Q1-Q3) - where 50% of measurements fall
 - **Line in box**: Median latency
 - **Whiskers**: Minimum and maximum values
-- **Dashed line**: Linear regression trend (computed from 100-1000 connections)
+- **Dashed line**: Linear regression trend (shown only in the 100-1000 panel)
+- **Colors**: Each PostgreSQL version uses a consistent color across all plots
 
-Smaller boxes = more consistent performance. The regression line slope indicates scaling efficiency.
+**Panel Layout**:
+- **Left (0-10)**: Shows every connection for fine-grained analysis of startup behavior
+- **Middle (10-100)**: Shows every 10th connection to reduce visual clutter
+- **Right (100-1000)**: Shows every 100th connection with regression analysis for scaling behavior
+
+Smaller boxes indicate more consistent performance. The regression line slope in the rightmost panel indicates scaling efficiency.
 
 ## Output Files
 
