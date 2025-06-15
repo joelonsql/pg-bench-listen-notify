@@ -45,18 +45,18 @@ fn calculate_stats(measurements: &[Measurement]) -> Stats {
     let initial_q1 = percentile(&values, 0.25);
     let initial_q3 = percentile(&values, 0.75);
     let iqr = initial_q3 - initial_q1;
-    
+
     // Define outlier boundaries (1.5 * IQR is standard)
     let lower_bound = initial_q1 - 1.5 * iqr;
     let upper_bound = initial_q3 + 1.5 * iqr;
-    
+
     // Filter out outliers
     let filtered_values: Vec<f64> = values
         .iter()
         .cloned()
         .filter(|&x| x >= lower_bound && x <= upper_bound)
         .collect();
-    
+
     // If too many values were filtered out, use original values
     let working_values = if filtered_values.len() < values.len() / 2 {
         &values
@@ -88,11 +88,11 @@ fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
     if len == 0 {
         return 0.0;
     }
-    
+
     let index = percentile * (len - 1) as f64;
     let lower = index.floor() as usize;
     let upper = index.ceil() as usize;
-    
+
     if lower == upper {
         sorted_values[lower]
     } else {
@@ -110,7 +110,7 @@ async fn find_free_port() -> Result<u16> {
     anyhow::bail!("No free port found")
 }
 
-async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, String, String)> {
+async fn setup_postgres(pg_bin_path: Option<&Path>, custom_version: Option<String>) -> Result<(TempDir, u16, String, String)> {
     // Build command paths
     let (initdb_cmd, pg_ctl_cmd, createdb_cmd) = if let Some(bin_path) = pg_bin_path {
         (
@@ -125,7 +125,7 @@ async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, Str
             PathBuf::from("createdb"),
         )
     };
-    
+
     // Check for PostgreSQL tools
     for (tool_name, tool_path) in &[("initdb", &initdb_cmd), ("pg_ctl", &pg_ctl_cmd), ("createdb", &createdb_cmd)] {
         Command::new(tool_path)
@@ -185,7 +185,7 @@ async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, Str
     // Connect to postgres database first (not testdb) to set max_connections
     println!("Configuring max connections...");
     let postgres_connection_string = format!("host=127.0.0.1 port={} dbname=postgres user={}", port, whoami::username());
-    
+
     // Try connecting with retries
     let mut connected = false;
     for i in 0..10 {
@@ -205,7 +205,7 @@ async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, Str
                     "ALTER SYSTEM SET work_mem = '1MB'",
                     "ALTER SYSTEM SET maintenance_work_mem = '256MB'",
                 ];
-                
+
                 let mut all_success = true;
                 for setting in &settings {
                     match client.execute(*setting, &[]).await {
@@ -216,7 +216,7 @@ async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, Str
                         }
                     }
                 }
-                
+
                 if all_success {
                     connected = true;
                     break;
@@ -271,7 +271,7 @@ async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, Str
     sleep(Duration::from_secs(3)).await;
 
     let connection_string = format!("host=127.0.0.1 port={} dbname=testdb user={}", port, whoami::username());
-    
+
     // Get PostgreSQL version
     let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await?;
     tokio::spawn(async move {
@@ -279,11 +279,18 @@ async fn setup_postgres(pg_bin_path: Option<&Path>) -> Result<(TempDir, u16, Str
             eprintln!("Version check connection error: {}", e);
         }
     });
-    
-    let row = client.query_one("SELECT version()", &[]).await?;
-    let version: String = row.get(0);
+
+    let version = if let Some(custom) = custom_version {
+        // Use custom version name if provided
+        custom
+    } else {
+        // Otherwise query PostgreSQL for its version
+        let row = client.query_one("SELECT version()", &[]).await?;
+        row.get(0)
+    };
+
     println!("PostgreSQL version: {}", version);
-    
+
     Ok((temp_dir, port, connection_string, version))
 }
 
@@ -293,7 +300,7 @@ async fn cleanup_postgres(data_dir: &PathBuf, _port: u16, pg_bin_path: Option<&P
     } else {
         PathBuf::from("pg_ctl")
     };
-    
+
     let output = Command::new(&pg_ctl_cmd)
         .arg("-D")
         .arg(data_dir)
@@ -361,7 +368,7 @@ async fn create_listener_thread(
 
         // Main notification loop
         let mut start_time = Instant::now();
-        
+
         while let Some(notification) = rx_notif.recv().await {
             let elapsed = start_time.elapsed();
 
@@ -382,7 +389,7 @@ async fn create_listener_thread(
 
             // Record new start time before sending notification
             start_time = Instant::now();
-            
+
             // Send notification to the other thread
             let other_thread = if thread_id == 1 { 2 } else { 1 };
             client.execute(&format!("SELECT pg_notify('thread_{}', NULL)", other_thread), &[]).await?;
@@ -437,42 +444,75 @@ async fn create_idle_listener(
 async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
-    let pg_bin_path = if args.len() > 1 {
-        Some(Path::new(&args[1]))
-    } else {
-        None
-    };
-    
-    let output_file = if args.len() > 2 {
-        &args[2]
-    } else {
-        "stats.csv"
-    };
-    
+    let mut pg_bin_path = None;
+    let mut output_file = "stats.csv";
+    let mut increment = 1;
+    let mut custom_version = None;
+
+    // Simple argument parsing
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--increment" => {
+                if i + 1 < args.len() {
+                    increment = args[i + 1].parse::<usize>()
+                        .context("Invalid increment value")?;
+                    if increment == 0 {
+                        anyhow::bail!("Increment must be greater than 0");
+                    }
+                    i += 2;
+                } else {
+                    anyhow::bail!("--increment requires a value");
+                }
+            }
+            "--version-name" => {
+                if i + 1 < args.len() {
+                    custom_version = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    anyhow::bail!("--version-name requires a value");
+                }
+            }
+            arg => {
+                // Positional arguments
+                if pg_bin_path.is_none() && !arg.starts_with("--") {
+                    pg_bin_path = Some(Path::new(arg));
+                } else if output_file == "stats.csv" && !arg.starts_with("--") {
+                    output_file = arg;
+                }
+                i += 1;
+            }
+        }
+    }
+
     if let Some(path) = pg_bin_path {
         println!("Using PostgreSQL binaries from: {:?}", path);
     }
-    
+    if let Some(ref version) = custom_version {
+        println!("Using custom version name: {}", version);
+    }
+    println!("Connection increment: {} per measurement", increment);
+
     // Check and increase OS limits
     println!("Checking and adjusting OS limits...");
-    
+
     // Get current limits
     let mut rlim = rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    
+
     unsafe {
         if libc::getrlimit(RLIMIT_NOFILE, &mut rlim) == 0 {
             println!("Current file descriptor limit: soft={}, hard={}", rlim.rlim_cur, rlim.rlim_max);
-            
+
             // Try to set to a high value (3000 should be enough for 1000 connections)
             let new_limit = 3000;
             rlim.rlim_cur = new_limit;
             if rlim.rlim_max < new_limit {
                 rlim.rlim_max = new_limit;
             }
-            
+
             if libc::setrlimit(RLIMIT_NOFILE, &rlim) == 0 {
                 println!("Successfully set file descriptor limit to {}", new_limit);
             } else {
@@ -484,16 +524,16 @@ async fn main() -> Result<()> {
                     eprintln!("Warning: Could not increase file descriptor limit");
                 }
             }
-            
+
             // Verify the new limit
             if libc::getrlimit(RLIMIT_NOFILE, &mut rlim) == 0 {
                 println!("New file descriptor limit: soft={}, hard={}", rlim.rlim_cur, rlim.rlim_max);
             }
         }
     }
-    
+
     println!("Setting up PostgreSQL...");
-    let (temp_dir, port, connection_string, pg_version) = setup_postgres(pg_bin_path).await?;
+    let (temp_dir, port, connection_string, pg_version) = setup_postgres(pg_bin_path, custom_version).await?;
     let data_dir = temp_dir.path().join("data");
 
     println!("PostgreSQL started on port {}", port);
@@ -510,12 +550,12 @@ async fn main() -> Result<()> {
     let row = monitor_client.query_one("SHOW max_connections", &[]).await?;
     let max_conn: &str = row.get(0);
     println!("PostgreSQL max_connections: {}", max_conn);
-    
+
     // Check other connection limits
     let row = monitor_client.query_one("SHOW superuser_reserved_connections", &[]).await?;
     let reserved: &str = row.get(0);
     println!("PostgreSQL superuser_reserved_connections: {}", reserved);
-    
+
     // Also check shared_buffers as it affects max connections
     let row = monitor_client.query_one("SHOW shared_buffers", &[]).await?;
     let shared_buffers: &str = row.get(0);
@@ -528,11 +568,11 @@ async fn main() -> Result<()> {
         .append(true)
         .open(output_file)?;
     let mut csv_writer = Writer::from_writer(file);
-    
+
     // Write header only if file is new
     if !file_exists {
         csv_writer.write_record(&[
-            "connections", "min_ms", "q1_ms", "median_ms", "q3_ms", "max_ms", 
+            "connections", "min_ms", "q1_ms", "median_ms", "q3_ms", "max_ms",
             "avg_ms", "stddev_ms", "version"
         ])?;
     }
@@ -581,13 +621,20 @@ async fn main() -> Result<()> {
             measurements.push_back(measurement);
             measurement_count += 1;
 
-            // Collect stats every 10 measurements per thread (20 total)
-            if measurement_count % 20 == 0 {
+            let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
+
+            // Determine measurement frequency based on connection count
+            let measurements_per_stat = if connection_count <= 100 {
+                200  // 100 measurements per thread for 0-100 connections
+            } else {
+                20   // 10 measurements per thread for 100+ connections
+            };
+
+            // Collect stats based on the appropriate frequency
+            if measurement_count % measurements_per_stat == 0 {
                 let recent: Vec<Measurement> = measurements.drain(..).collect();
                 let stats = calculate_stats(&recent);
 
-                let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
-                
                 // Count outliers for information
                 let raw_values: Vec<f64> = recent.iter()
                     .map(|m| m.round_trip_ns as f64 / 1_000_000.0)
@@ -598,7 +645,7 @@ async fn main() -> Result<()> {
                 let outliers = raw_values.iter()
                     .filter(|&&x| x < initial_q1 - 1.5 * iqr || x > initial_q3 + 1.5 * iqr)
                     .count();
-                
+
                 println!(
                     "Connections: {:5}, Min: {:7.2}ms, Q1: {:7.2}ms, Median: {:7.2}ms, Q3: {:7.2}ms, Max: {:7.2}ms (outliers: {})",
                     connection_count, stats.min, stats.q1, stats.median, stats.q3, stats.max, outliers
@@ -619,16 +666,35 @@ async fn main() -> Result<()> {
                 csv_writer.flush()?;
 
                 if phase == "increasing" {
-                    // Create new idle listener
-                    match create_idle_listener(connection_string.clone(), next_thread_id).await {
-                        Ok(idle_thread) => {
-                            idle_threads.push(idle_thread);
-                            next_thread_id += 1;
+                    // Create new idle listeners based on increment
+                    let mut added = 0;
+                    for _ in 0..increment {
+                        if idle_threads.len() >= 1000 {
+                            break;
                         }
-                        Err(e) => {
-                            eprintln!("Failed to create idle listener {}: {}", next_thread_id, e);
-                            eprintln!("Connection string: {}", connection_string);
+                        match create_idle_listener(connection_string.clone(), next_thread_id).await {
+                            Ok(idle_thread) => {
+                                idle_threads.push(idle_thread);
+                                next_thread_id += 1;
+                                added += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to create idle listener {}: {}", next_thread_id, e);
+                                eprintln!("Connection string: {}", connection_string);
+                                break;
+                            }
                         }
+                    }
+
+                    if added > 0 && added < increment && idle_threads.len() < 1000 {
+                        eprintln!("Warning: Only added {} connections instead of {}", added, increment);
+                    }
+
+                    // Reset measurement count when crossing 100 connections threshold
+                    if connection_count == 101 && added > 0 {
+                        measurement_count = 0;
+                        measurements.clear();
+                        println!("Crossed 100 connections, switching to faster measurement frequency");
                     }
 
                     // Switch to decreasing phase after reaching 1000
@@ -637,11 +703,21 @@ async fn main() -> Result<()> {
                         phase = "decreasing";
                     }
                 } else if phase == "decreasing" {
-                    // Remove one idle connection
-                    if let Some(handle) = idle_threads.pop() {
-                        handle.abort();
+                    // Remove connections based on increment
+                    let to_remove = increment.min(idle_threads.len());
+                    for _ in 0..to_remove {
+                        if let Some(handle) = idle_threads.pop() {
+                            handle.abort();
+                        }
                     }
-                    
+
+                    // Reset measurement count when crossing back under 100 connections
+                    if connection_count == 100 && to_remove > 0 {
+                        measurement_count = 0;
+                        measurements.clear();
+                        println!("Crossed back under 100 connections, switching to slower measurement frequency");
+                    }
+
                     // Stop when we're back to just the two main threads
                     if idle_threads.is_empty() {
                         println!("Back to 2 connections, stopping...");
