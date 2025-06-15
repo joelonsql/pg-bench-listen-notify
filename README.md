@@ -88,6 +88,112 @@ The optimization patch eliminates the O(N) scaling entirely, achieving constant-
 
 **Key takeaway:** LISTEN/NOTIFY performance degrades linearly with connection count because PostgreSQL must check every listening connection when delivering a notification, even if those connections are completely idle.
 
+## Detailed Scaling Analysis Output
+
+Here's the complete output from `analyze_scaling.py` showing the mathematical analysis of each PostgreSQL version:
+
+```
+PostgreSQL LISTEN/NOTIFY Scaling Analysis (connections >= 100)
+================================================================================
+
+Version: PostgreSQL 13.21 (Postgres.app) on x86_64-apple-darwin19.6.0, compiled by Apple clang version 11.0.3 (clang-1103.0.32.62), 64-bit
+  Complexity: O(N)
+  Latency formula: -0.034 + 12.419×10⁻³ × N ms
+  Mean latency: 6.812 ms ± 3.334 ms
+  Coefficient of variation: 48.9%
+  R² value: 0.9439
+  Slope: 12.419 μs/connection
+  Data points: 1807
+
+Version: PostgreSQL 14.18 (Postgres.app) on aarch64-apple-darwin20.6.0, compiled by Apple clang version 12.0.5 (clang-1205.0.22.9), 64-bit
+  Complexity: O(N)
+  Latency formula: 0.079 + 4.250×10⁻³ × N ms
+  Mean latency: 2.421 ms ± 1.110 ms
+  Coefficient of variation: 45.8%
+  R² value: 0.9975
+  Slope: 4.250 μs/connection
+  Data points: 1807
+
+Version: PostgreSQL 15.13 (Postgres.app) on aarch64-apple-darwin21.6.0, compiled by Apple clang version 14.0.0 (clang-1400.0.29.102), 64-bit
+  Complexity: O(N)
+  Latency formula: 0.086 + 4.200×10⁻³ × N ms
+  Mean latency: 2.402 ms ± 1.097 ms
+  Coefficient of variation: 45.7%
+  R² value: 0.9974
+  Slope: 4.200 μs/connection
+  Data points: 1807
+
+Version: PostgreSQL 16.9 (Postgres.app) on aarch64-apple-darwin21.6.0, compiled by Apple clang version 14.0.0 (clang-1400.0.29.102), 64-bit
+  Complexity: O(N)
+  Latency formula: 0.079 + 4.245×10⁻³ × N ms
+  Mean latency: 2.420 ms ± 1.109 ms
+  Coefficient of variation: 45.8%
+  R² value: 0.9975
+  Slope: 4.245 μs/connection
+  Data points: 1807
+
+Version: PostgreSQL 17.5 (Postgres.app) on aarch64-apple-darwin23.6.0, compiled by Apple clang version 15.0.0 (clang-1500.3.9.4), 64-bit
+  Complexity: O(N)
+  Latency formula: 0.078 + 4.232×10⁻³ × N ms
+  Mean latency: 2.410 ms ± 1.104 ms
+  Coefficient of variation: 45.8%
+  R² value: 0.9989
+  Slope: 4.232 μs/connection
+  Data points: 1807
+
+Version: HEAD
+  Complexity: O(N)
+  Latency formula: 0.087 + 4.159×10⁻³ × N ms
+  Mean latency: 2.380 ms ± 1.086 ms
+  Coefficient of variation: 45.6%
+  R² value: 0.9980
+  Slope: 4.159 μs/connection
+  Data points: 1807
+
+Version: jj/notify-single-listener-opt
+  Complexity: O(1)
+  Latency formula: ≈ 0.102 ms (constant)
+  Mean latency: 0.102 ms ± 0.016 ms
+  Coefficient of variation: 16.0%
+  R² value: 0.0078
+  Slope: 0.006 μs/connection
+  Data points: 1807
+
+
+Summary Table
+--------------------------------------------------------------------------------
+Version                             Complexity Formula
+--------------------------------------------------------------------------------
+PostgreSQL 13.21                    O(N)       -0.034 + 12.419×10⁻³ × N ms
+PostgreSQL 14.18                    O(N)       0.079 + 4.250×10⁻³ × N ms
+PostgreSQL 15.13                    O(N)       0.086 + 4.200×10⁻³ × N ms
+PostgreSQL 16.9                     O(N)       0.079 + 4.245×10⁻³ × N ms
+PostgreSQL 17.5                     O(N)       0.078 + 4.232×10⁻³ × N ms
+HEAD                                O(N)       0.087 + 4.159×10⁻³ × N ms
+jj/notify-single-listener-opt       O(1)       ≈ 0.102 ms (constant)
+--------------------------------------------------------------------------------
+
+O(1) scaling (constant time): 1 versions
+O(N) scaling (linear with connections): 6 versions
+
+O(1) versions (excellent scaling):
+  - jj/notify-single-listener-opt: 0.102 ms average
+
+O(N) versions (latency increases with connections):
+  - PostgreSQL 13.21: 12.4 μs per connection
+  - PostgreSQL 14.18: 4.2 μs per connection
+  - PostgreSQL 15.13: 4.2 μs per connection
+  - PostgreSQL 16.9: 4.2 μs per connection
+  - PostgreSQL 17.5: 4.2 μs per connection
+  - HEAD: 4.2 μs per connection
+```
+
+### Key Observations from the Analysis
+
+- **R² values**: PostgreSQL 14+ shows excellent linear fit (R² > 0.997), while v13 has more variance (R² = 0.944)
+- **Coefficient of variation**: The optimization patch has much lower variance (16%) compared to standard versions (45-49%)
+- **Slope significance**: The near-zero slope (0.006 μs/connection) for the optimization patch confirms true O(1) behavior
+
 ## How the Benchmark Works
 
 The tool creates a controlled test environment:
