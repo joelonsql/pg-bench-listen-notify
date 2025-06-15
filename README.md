@@ -2,6 +2,10 @@
 
 A benchmarking tool that measures how PostgreSQL LISTEN/NOTIFY performance scales with the number of idle listening connections.
 
+> **⚠️ IMPORTANT DISCLAIMER**
+> 
+> The `jj/notify-single-listener-opt` patch referenced in this benchmark has **not been carefully reviewed** by experts in PostgreSQL's async.c subsystem. While the benchmark results show promising O(1) performance characteristics, these results might be misleading if the optimization approach has unforeseen issues or doesn't work correctly in practice. The patch must undergo thorough review and testing before any conclusions are drawn about its viability.
+
 ## Key Results
 
 ### Overall Comparison
