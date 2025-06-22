@@ -150,6 +150,32 @@ async fn setup_postgres(pg_bin_path: Option<&Path>, custom_version: Option<Strin
         anyhow::bail!("initdb failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
+    // Configure PostgreSQL settings by appending to postgresql.conf
+    println!("Configuring PostgreSQL settings...");
+    let config_file = data_dir.join("postgresql.conf");
+
+    // Append configuration settings
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&config_file)
+        .context("Failed to open postgresql.conf")?;
+
+    // With 128GB RAM, use 25% (32GB) for shared_buffers
+    let config_settings = r#"
+# Custom settings for benchmarking
+max_connections = 2000
+shared_buffers = 32GB
+work_mem = 1MB
+maintenance_work_mem = 256MB
+"#;
+
+    file.write_all(config_settings.as_bytes())
+        .context("Failed to write to postgresql.conf")?;
+
+    println!("Appended configuration to postgresql.conf");
 
     // Start PostgreSQL
     let output = Command::new(&pg_ctl_cmd)
@@ -181,94 +207,6 @@ async fn setup_postgres(pg_bin_path: Option<&Path>, custom_version: Option<Strin
     if !output.status.success() {
         anyhow::bail!("createdb failed: {}", String::from_utf8_lossy(&output.stderr));
     }
-
-    // Connect to postgres database first (not testdb) to set max_connections
-    println!("Configuring max connections...");
-    let postgres_connection_string = format!("host=127.0.0.1 port={} dbname=postgres user={}", port, whoami::username());
-
-    // Try connecting with retries
-    let mut connected = false;
-    for i in 0..10 {
-        match tokio_postgres::connect(&postgres_connection_string, NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        eprintln!("Setup connection error: {}", e);
-                    }
-                });
-
-                // Set multiple parameters for high connection count
-                // With 128GB RAM, use 25% (32GB) for shared_buffers
-                let settings = vec![
-                    "ALTER SYSTEM SET max_connections = 2000",
-                    "ALTER SYSTEM SET shared_buffers = '32GB'",
-                    "ALTER SYSTEM SET work_mem = '1MB'",
-                    "ALTER SYSTEM SET maintenance_work_mem = '256MB'",
-                ];
-
-                let mut all_success = true;
-                for setting in &settings {
-                    match client.execute(*setting, &[]).await {
-                        Ok(_) => println!("Applied: {}", setting),
-                        Err(e) => {
-                            eprintln!("{} failed: {}", setting, e);
-                            all_success = false;
-                        }
-                    }
-                }
-
-                if all_success {
-                    connected = true;
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("Connection attempt {} failed: {}", i + 1, e);
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-    if !connected {
-        anyhow::bail!("Failed to connect and set max_connections");
-    }
-
-    // Stop PostgreSQL
-    println!("Stopping PostgreSQL...");
-    let output = Command::new(&pg_ctl_cmd)
-        .arg("-D")
-        .arg(&data_dir)
-        .arg("-m")
-        .arg("fast")
-        .arg("stop")
-        .output()?;
-
-    if !output.status.success() {
-        eprintln!("pg_ctl stop warning: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    // Wait for shutdown
-    sleep(Duration::from_secs(2)).await;
-
-    // Start PostgreSQL again with new settings
-    println!("Starting PostgreSQL with new settings...");
-    let output = Command::new(&pg_ctl_cmd)
-        .arg("-D")
-        .arg(&data_dir)
-        .arg("-l")
-        .arg(temp_dir.path().join("logfile"))
-        .arg("-o")
-        .arg(format!("-p {}", port))
-        .arg("start")
-        .output()?;
-
-    if !output.status.success() {
-        anyhow::bail!("pg_ctl start (after restart) failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    // Wait for PostgreSQL to start
-    println!("Waiting for PostgreSQL to start...");
-    sleep(Duration::from_secs(3)).await;
 
     let connection_string = format!("host=127.0.0.1 port={} dbname=testdb user={}", port, whoami::username());
 
