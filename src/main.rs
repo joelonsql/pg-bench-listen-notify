@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use libc::{rlimit, RLIMIT_NOFILE};
 use csv::Writer;
-use std::collections::VecDeque;
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,91 +14,13 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
+const MAX_CONNECTIONS: usize = 1000;
+
 #[derive(Debug, Clone)]
 struct Measurement {
     round_trip_ns: u128,
     #[allow(dead_code)]
     thread_id: usize,
-}
-
-#[derive(Debug)]
-struct Stats {
-    min: f64,
-    q1: f64,     // First quartile (25th percentile)
-    median: f64, // Second quartile (50th percentile)
-    q3: f64,     // Third quartile (75th percentile)
-    max: f64,
-    avg: f64,
-    stddev: f64,
-}
-
-fn calculate_stats(measurements: &[Measurement]) -> Stats {
-    let mut values: Vec<f64> = measurements
-        .iter()
-        .map(|m| m.round_trip_ns as f64 / 1_000_000.0) // Convert to milliseconds
-        .collect();
-
-    // Sort values for percentile calculations
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    // Calculate initial quartiles for outlier detection
-    let initial_q1 = percentile(&values, 0.25);
-    let initial_q3 = percentile(&values, 0.75);
-    let iqr = initial_q3 - initial_q1;
-
-    // Define outlier boundaries (1.5 * IQR is standard)
-    let lower_bound = initial_q1 - 1.5 * iqr;
-    let upper_bound = initial_q3 + 1.5 * iqr;
-
-    // Filter out outliers
-    let filtered_values: Vec<f64> = values
-        .iter()
-        .cloned()
-        .filter(|&x| x >= lower_bound && x <= upper_bound)
-        .collect();
-
-    // If too many values were filtered out, use original values
-    let working_values = if filtered_values.len() < values.len() / 2 {
-        &values
-    } else {
-        &filtered_values
-    };
-
-    let len = working_values.len();
-    let min = working_values[0];
-    let max = working_values[len - 1];
-    let avg = working_values.iter().sum::<f64>() / len as f64;
-
-    // Calculate quartiles on filtered data
-    let q1 = percentile(working_values, 0.25);
-    let median = percentile(working_values, 0.50);
-    let q3 = percentile(working_values, 0.75);
-
-    let variance = working_values
-        .iter()
-        .map(|&x| (x - avg).powi(2))
-        .sum::<f64>() / len as f64;
-    let stddev = variance.sqrt();
-
-    Stats { min, q1, median, q3, max, avg, stddev }
-}
-
-fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
-    let len = sorted_values.len();
-    if len == 0 {
-        return 0.0;
-    }
-
-    let index = percentile * (len - 1) as f64;
-    let lower = index.floor() as usize;
-    let upper = index.ceil() as usize;
-
-    if lower == upper {
-        sorted_values[lower]
-    } else {
-        let weight = index - lower as f64;
-        sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
-    }
 }
 
 async fn find_free_port() -> Result<u16> {
@@ -444,8 +366,8 @@ async fn main() -> Result<()> {
         if libc::getrlimit(RLIMIT_NOFILE, &mut rlim) == 0 {
             println!("Current file descriptor limit: soft={}, hard={}", rlim.rlim_cur, rlim.rlim_max);
 
-            // Try to set to a high value (3000 should be enough for 1000 connections)
-            let new_limit = 3000;
+            // Try to set to a high value (3 times MAX_CONNECTIONS should be enough)
+            let new_limit = (MAX_CONNECTIONS * 3) as u64;
             rlim.rlim_cur = new_limit;
             if rlim.rlim_max < new_limit {
                 rlim.rlim_max = new_limit;
@@ -510,8 +432,7 @@ async fn main() -> Result<()> {
     // Write header only if file is new
     if !file_exists {
         csv_writer.write_record(&[
-            "connections", "min_ms", "q1_ms", "median_ms", "q3_ms", "max_ms",
-            "avg_ms", "stddev_ms", "version"
+            "connections", "latency_ms", "version"
         ])?;
     }
 
@@ -547,120 +468,62 @@ async fn main() -> Result<()> {
 
     println!("Threads ready, starting measurements...");
 
-    let mut measurements = VecDeque::new();
     let mut idle_threads = Vec::new();
     let mut next_thread_id = 3;
     let mut measurement_count = 0;
-    let mut phase = "increasing"; // "increasing" or "decreasing"
 
     // Main measurement loop
     loop {
         if let Ok(measurement) = rx.try_recv() {
-            measurements.push_back(measurement);
+            let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
+            let latency_ms = measurement.round_trip_ns as f64 / 1_000_000.0;
+
+            // Write individual measurement to CSV
+            csv_writer.write_record(&[
+                connection_count.to_string(),
+                format!("{:.2}", latency_ms),
+                pg_version.clone(),
+            ])?;
+            csv_writer.flush()?;
+
             measurement_count += 1;
 
-            let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
+            // Print progress every 20 measurements
+            if measurement_count % 20 == 0 {
+                println!("Connections: {:5}, Latest latency: {:7.2}ms (measurement {})", 
+                         connection_count, latency_ms, measurement_count);
+            }
 
-            // Determine measurement frequency based on connection count
-            let measurements_per_stat = if connection_count <= 100 {
-                200  // 100 measurements per thread for 0-100 connections
-            } else {
-                20   // 10 measurements per thread for 100+ connections
-            };
-
-            // Collect stats based on the appropriate frequency
-            if measurement_count % measurements_per_stat == 0 {
-                let recent: Vec<Measurement> = measurements.drain(..).collect();
-                let stats = calculate_stats(&recent);
-
-                // Count outliers for information
-                let raw_values: Vec<f64> = recent.iter()
-                    .map(|m| m.round_trip_ns as f64 / 1_000_000.0)
-                    .collect();
-                let initial_q1 = percentile(&{let mut v = raw_values.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v}, 0.25);
-                let initial_q3 = percentile(&{let mut v = raw_values.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v}, 0.75);
-                let iqr = initial_q3 - initial_q1;
-                let outliers = raw_values.iter()
-                    .filter(|&&x| x < initial_q1 - 1.5 * iqr || x > initial_q3 + 1.5 * iqr)
-                    .count();
-
-                println!(
-                    "Connections: {:5}, Min: {:7.2}ms, Q1: {:7.2}ms, Median: {:7.2}ms, Q3: {:7.2}ms, Max: {:7.2}ms (outliers: {})",
-                    connection_count, stats.min, stats.q1, stats.median, stats.q3, stats.max, outliers
-                );
-
-                // Write to CSV
-                csv_writer.write_record(&[
-                    connection_count.to_string(),
-                    format!("{:.2}", stats.min),
-                    format!("{:.2}", stats.q1),
-                    format!("{:.2}", stats.median),
-                    format!("{:.2}", stats.q3),
-                    format!("{:.2}", stats.max),
-                    format!("{:.2}", stats.avg),
-                    format!("{:.2}", stats.stddev),
-                    pg_version.clone(),
-                ])?;
-                csv_writer.flush()?;
-
-                if phase == "increasing" {
-                    // Create new idle listeners based on increment
-                    let mut added = 0;
-                    for _ in 0..increment {
-                        if idle_threads.len() >= 1000 {
-                            break;
-                        }
-                        match create_idle_listener(connection_string.clone(), next_thread_id).await {
-                            Ok(idle_thread) => {
-                                idle_threads.push(idle_thread);
-                                next_thread_id += 1;
-                                added += 1;
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to create idle listener {}: {}", next_thread_id, e);
-                                eprintln!("Connection string: {}", connection_string);
-                                break;
-                            }
-                        }
-                    }
-
-                    if added > 0 && added < increment && idle_threads.len() < 1000 {
-                        eprintln!("Warning: Only added {} connections instead of {}", added, increment);
-                    }
-
-                    // Reset measurement count when crossing 100 connections threshold
-                    if connection_count == 101 && added > 0 {
-                        measurement_count = 0;
-                        measurements.clear();
-                        println!("Crossed 100 connections, switching to faster measurement frequency");
-                    }
-
-                    // Switch to decreasing phase after reaching 1000
-                    if idle_threads.len() >= 1000 {
-                        println!("Reached 1000 idle connections, now decreasing...");
-                        phase = "decreasing";
-                    }
-                } else if phase == "decreasing" {
-                    // Remove connections based on increment
-                    let to_remove = increment.min(idle_threads.len());
-                    for _ in 0..to_remove {
-                        if let Some(handle) = idle_threads.pop() {
-                            handle.abort();
-                        }
-                    }
-
-                    // Reset measurement count when crossing back under 100 connections
-                    if connection_count == 100 && to_remove > 0 {
-                        measurement_count = 0;
-                        measurements.clear();
-                        println!("Crossed back under 100 connections, switching to slower measurement frequency");
-                    }
-
-                    // Stop when we're back to just the two main threads
-                    if idle_threads.is_empty() {
-                        println!("Back to 2 connections, stopping...");
+            // Add new connections every 20 measurements
+            if measurement_count % 20 == 0 {
+                // Create new idle listeners based on increment
+                let mut added = 0;
+                for _ in 0..increment {
+                    if idle_threads.len() >= MAX_CONNECTIONS {
                         break;
                     }
+                    match create_idle_listener(connection_string.clone(), next_thread_id).await {
+                        Ok(idle_thread) => {
+                            idle_threads.push(idle_thread);
+                            next_thread_id += 1;
+                            added += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create idle listener {}: {}", next_thread_id, e);
+                            eprintln!("Connection string: {}", connection_string);
+                            break;
+                        }
+                    }
+                }
+
+                if added > 0 && added < increment && idle_threads.len() < MAX_CONNECTIONS {
+                    eprintln!("Warning: Only added {} connections instead of {}", added, increment);
+                }
+
+                // Stop when we reach MAX_CONNECTIONS connections
+                if idle_threads.len() >= MAX_CONNECTIONS {
+                    println!("Reached {} idle connections, stopping...", MAX_CONNECTIONS);
+                    break;
                 }
             }
         } else {
