@@ -23,6 +23,13 @@ struct Measurement {
     thread_id: usize,
 }
 
+#[derive(Debug, Clone)]
+struct BenchmarkResult {
+    connection_count: usize,
+    latency_ms: f64,
+    version: String,
+}
+
 async fn find_free_port() -> Result<u16> {
     for port in 5432..65535 {
         if port_scanner::local_port_available(port) {
@@ -471,6 +478,7 @@ async fn main() -> Result<()> {
     let mut idle_threads = Vec::new();
     let mut next_thread_id = 3;
     let mut measurement_count = 0;
+    let mut benchmark_results: Vec<BenchmarkResult> = Vec::new();
 
     // Main measurement loop
     loop {
@@ -478,13 +486,12 @@ async fn main() -> Result<()> {
             let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
             let latency_ms = measurement.round_trip_ns as f64 / 1_000_000.0;
 
-            // Write individual measurement to CSV
-            csv_writer.write_record(&[
-                connection_count.to_string(),
-                format!("{:.2}", latency_ms),
-                pg_version.clone(),
-            ])?;
-            csv_writer.flush()?;
+            // Store measurement for later CSV writing
+            benchmark_results.push(BenchmarkResult {
+                connection_count,
+                latency_ms,
+                version: pg_version.clone(),
+            });
 
             measurement_count += 1;
 
@@ -530,6 +537,18 @@ async fn main() -> Result<()> {
             sleep(Duration::from_millis(1)).await;
         }
     }
+
+    // Write all collected measurements to CSV
+    println!("Writing {} measurements to CSV...", benchmark_results.len());
+    for result in benchmark_results {
+        csv_writer.write_record(&[
+            result.connection_count.to_string(),
+            format!("{:.2}", result.latency_ms),
+            result.version,
+        ])?;
+    }
+    csv_writer.flush()?;
+    println!("CSV writing complete.");
 
     // Cleanup
     println!("Cleaning up...");
