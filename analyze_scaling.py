@@ -20,15 +20,15 @@ def analyze_scaling(csv_file='benchmark_results.csv'):
         if version not in versions:
             versions.append(version)
 
-    print("PostgreSQL LISTEN/NOTIFY Scaling Analysis (connections >= 100)")
+    print("PostgreSQL LISTEN/NOTIFY Scaling Analysis (all connections)")
     print("=" * 80)
     print()
 
     results = []
 
     for version in versions:
-        # Filter for this version and connections >= 100
-        version_df = df[(df['version'] == version) & (df['connections'] >= 100)].copy()
+        # Filter for this version
+        version_df = df[df['version'] == version].copy()
 
         if len(version_df) < 3:
             print(f"Insufficient data for {version}")

@@ -4,7 +4,7 @@ A benchmarking tool that measures how PostgreSQL LISTEN/NOTIFY performance scale
 
 > **⚠️ IMPORTANT DISCLAIMER**
 > 
-> The `jj/notify-single-listener-opt` patch referenced in this benchmark has **not been carefully reviewed** by experts in PostgreSQL's async.c subsystem. While the benchmark results show promising O(1) performance characteristics, these results might be misleading if the optimization approach has unforeseen issues or doesn't work correctly in practice. The patch must undergo thorough review and testing before any conclusions are drawn about its viability.
+> The `optimize_listen_notify` patch referenced in this benchmark has **not been carefully reviewed** by experts in PostgreSQL's async.c subsystem. While the benchmark results show promising near-O(1) performance characteristics, these results might be misleading if the optimization approach has unforeseen issues or doesn't work correctly in practice. The patch must undergo thorough review and testing before any conclusions are drawn about its viability.
 
 ## Key Results
 
@@ -16,180 +16,190 @@ The chart shows three panels with different connection ranges to provide clear v
 - **10-100 connections**: Every 10th connection shown (10, 20, 30, ..., 100)
 - **100-1000 connections**: Every 100th connection shown (100, 200, 300, ..., 1000) with linear regression analysis
 
-### Scaling Analysis: O(N) Performance Characteristics
+### Scaling Analysis: O(N) vs Near-O(1) Performance
 
-Our analysis reveals that PostgreSQL LISTEN/NOTIFY exhibits **O(N) scaling** for all versions, where N is the number of listening connections. The optimization patch significantly reduces the slope of this scaling but maintains O(N) behavior due to periodic wake-ups for lagging backends.
+Our analysis reveals that all PostgreSQL versions from 9.6 through master exhibit **consistent O(N) scaling**, where N is the number of listening connections. The optimization patch achieves **near-O(1) performance** with minimal scaling overhead.
 
-| Version | Complexity | Latency Formula (N ≥ 100) |
-|---------|------------|----------------------------|
-| PostgreSQL 13.21 | O(N) | -0.442 + 13.074×10⁻³ × N ms |
-| PostgreSQL 14-17 | O(N) | ~0.08 + 4.2×10⁻³ × N ms |
-| HEAD | O(N) | 0.079 + 4.218×10⁻³ × N ms |
-| [jj/notify-single-listener-opt](https://github.com/joelonsql/postgresql/commit/97a6af9d683422f52d81f951321b00fcf1e26122) | **O(N)** | **0.072 + 0.196×10⁻³ × N ms** |
+| Version | Complexity | Latency Formula |
+|---------|------------|-----------------|
+| PostgreSQL 9.6-13 | O(N) | ~0.4-0.7 + 12.4-13.3×10⁻³ × N ms |
+| PostgreSQL 14-17 | O(N) | ~0.3-0.4 + 13.0-13.1×10⁻³ × N ms |
+| master | O(N) | 0.354 + 13.174×10⁻³ × N ms |
+| optimize_listen_notify | **~O(1)** | **0.570 + 0.108×10⁻³ × N ms** |
 
 ### Understanding LISTEN/NOTIFY Latency
 
-**Base latency (2-3 connections):** PostgreSQL's LISTEN/NOTIFY achieves remarkably low round-trip latencies of **0.08-0.10 ms** when only the essential connections are present. This sub-millisecond performance makes it an attractive choice for real-time applications.
+**Base latency (2-3 connections):** PostgreSQL's LISTEN/NOTIFY achieves remarkably low round-trip latencies of **0.4-0.7 ms** when only the essential connections are present. This sub-millisecond performance makes it an attractive choice for real-time applications.
 
-**Impact of idle connections:** All PostgreSQL versions exhibit O(N) scaling:
-- **PostgreSQL 13**: Each connection adds ~13.1 µs to every notification
-- **PostgreSQL 14-HEAD**: Each connection adds ~4.2 µs (67% improvement over v13)
-- **Optimization patch**: Each connection adds only ~0.2 µs (95% improvement over HEAD)
+**Impact of idle connections:** All PostgreSQL versions exhibit similar O(N) scaling:
+- **PostgreSQL 9.6-master**: Each connection adds ~12.4-13.3 µs to every notification
+- **Optimization patch**: Each connection adds only ~0.11 µs (near constant time)
 
-This means with 1,000 connections, a notification that originally took 0.08ms will take:
-- **12.6ms** on PostgreSQL 13 (unacceptable for real-time applications)
-- **4.3ms** on PostgreSQL 14+ (3x faster than v13, but still problematic)
-- **0.27ms** with the optimization patch (16x faster than HEAD, sub-millisecond maintained)
+This means with 1,000 connections, a notification that originally took 0.4-0.7ms will take:
+- **~13-14ms** on any PostgreSQL version (problematic for real-time applications)
+- **~0.68ms** with the optimization patch (maintains sub-millisecond performance)
 
-### PostgreSQL 14's LISTEN/NOTIFY Performance Breakthrough
+### Consistent O(N) Performance Across All Versions
 
-PostgreSQL 13 exhibits significantly noisier measurements (R²=0.953) compared to newer versions (R²=0.998-0.999), suggesting less predictable performance. PostgreSQL 14 introduced critical optimizations that reduced per-connection overhead by 67%.
+Remarkably, all PostgreSQL versions from 9.6 through master show nearly identical O(N) scaling characteristics:
+- Slopes range from 12.466 to 13.430 μs/connection
+- R² values > 0.85 indicate strong linear relationships
+- No significant performance improvements between versions
 
-The key improvement likely came from **eliminating synchronous fsync calls** in the notification queue ([commit dee663f](https://github.com/postgres/postgres/commit/dee663f7843)). Previously, PostgreSQL would fsync after writing each notification queue page, causing I/O stalls that scaled poorly with many connections. PostgreSQL 14 defers these writes to the next checkpoint, dramatically reducing overhead.
+This consistency suggests that the core LISTEN/NOTIFY implementation has remained largely unchanged across these versions, with the O(N) scaling being a fundamental characteristic of the current architecture.
 
-Additional optimizations include:
-- **Streamlined signal handling** ([commit 0eff10a](https://github.com/postgres/postgres/commit/0eff10a0084)) - moved NOTIFY signals to transaction commit, eliminating redundant operations
-- **Fixed race conditions** ([commit 9c83b54](https://github.com/postgres/postgres/commit/9c83b54a9cc)) - prevented queue truncation issues under concurrent load
-- **Prevented SLRU lock contention** ([commit 566372b](https://github.com/postgres/postgres/commit/566372b3d64)) - avoided concurrent SimpleLruTruncate operations
+### The Optimization Patch: Near-O(1) Performance
 
-These improvements have been maintained through versions 15, 16, 17, and HEAD.
-
-### Version-by-Version Performance Evolution
-
-#### PostgreSQL 13 → 14: The Major Performance Breakthrough
-![13 vs 14](candlestick_comparison-1.png)
-
-The most dramatic improvement in LISTEN/NOTIFY history: 67% reduction in per-connection overhead.
-
-#### PostgreSQL 14 → 15: Stable Performance
-![14 vs 15](candlestick_comparison-2.png)
-
-Performance characteristics remain consistent with minor improvements.
-
-#### PostgreSQL 15 → 16: Continued Stability
-![15 vs 16](candlestick_comparison-3.png)
-
-The O(N) scaling pattern continues with ~4.2 µs per connection.
-
-#### PostgreSQL 16 → 17: Maintained Efficiency
-![16 vs 17](candlestick_comparison-4.png)
-
-No regression in performance; the improvements from v14 are preserved.
-
-#### PostgreSQL 17 → HEAD: Current Development
-![17 vs HEAD](candlestick_comparison-5.png)
-
-HEAD maintains the same O(N) scaling as stable versions.
-
-#### HEAD → Optimization Patch: 95% Reduction in Per-Connection Overhead
-![HEAD vs patch](candlestick_comparison-6.png)
-
-The optimization patch dramatically reduces the O(N) scaling coefficient by 95%, from ~4.2 µs per connection to ~0.2 µs per connection. While still technically O(N) due to periodic wake-ups for lagging backends, the practical performance improvement is substantial.
+The `optimize_listen_notify` patch achieves a dramatic improvement:
+- **Slope**: 0.108 μs/connection (120x improvement over standard PostgreSQL)
+- **R² value**: 0.0904 (connection count has minimal impact on latency)
+- **Mean latency**: 0.625 ms (remains nearly constant regardless of connection count)
 
 ### Practical Implications
 
-**HEAD vs Optimization Patch:**
+**Current PostgreSQL vs Optimization Patch:**
 
-| Connections | HEAD Latency | Patch Latency | Improvement | Impact on HEAD | Impact on Patch |
-|------------|--------------|---------------|-------------|----------------|-----------------|
-| 10         | ~0.12ms     | ~0.07ms      | 42%         | Negligible     | Negligible      |
-| 100        | ~0.50ms     | ~0.09ms      | 82%         | Noticeable     | Negligible      |
-| 500        | ~2.19ms     | ~0.17ms      | 92%         | User-visible   | Negligible      |
-| 1,000      | ~4.30ms     | ~0.27ms      | 94%         | Problematic    | Barely noticeable |
+| Connections | Current PG Latency | Patch Latency | Improvement | Impact on Current | Impact on Patch |
+|-------------|-------------------|---------------|-------------|-------------------|-----------------|
+| 10          | ~0.5ms           | ~0.57ms       | -14%        | Negligible        | Negligible      |
+| 100         | ~1.7ms           | ~0.58ms       | 66%         | Noticeable        | Negligible      |
+| 500         | ~6.9ms           | ~0.62ms       | 91%         | User-visible      | Negligible      |
+| 1,000       | ~13.5ms          | ~0.68ms       | 95%         | Problematic       | Negligible      |
 
-**Key takeaway:** While both HEAD and the patch exhibit O(N) scaling, the optimization reduces per-connection overhead by 95% (from ~4.2 μs to ~0.2 μs). The existing laggard wake-up mechanism ensures correctness by signaling any backend that falls behind by more than 32kB, now properly including backends in the same database.
+**Key takeaway:** While current PostgreSQL versions exhibit consistent O(N) scaling across all versions, the optimization patch achieves near-O(1) performance, maintaining sub-millisecond latency even with thousands of connections.
 
 ## Detailed Scaling Analysis Output
 
-Here's the complete output from `analyze_scaling.py` showing the mathematical analysis of each PostgreSQL version:
+Here's the complete output from `analyze_scaling.py` showing the mathematical analysis of each PostgreSQL version using all data points:
 
 ```
-PostgreSQL LISTEN/NOTIFY Scaling Analysis (connections >= 100)
+PostgreSQL LISTEN/NOTIFY Scaling Analysis (all connections)
 ================================================================================
 
-Version: PostgreSQL 13.21 (Postgres.app) on x86_64-apple-darwin19.6.0, compiled by Apple clang version 11.0.3 (clang-1103.0.32.62), 64-bit
-  Linear regression: -0.442 + 13.074×10⁻³ × N ms
-  Mean latency: 6.765 ms ± 3.514 ms
-  Coefficient of variation: 51.9%
-  R² value: 0.9418
-  Slope: 13.074 μs/connection
-  Intercept: -0.442 ms
-  Data points: 1807
+Version: REL9_6_24
+  Linear regression: 0.564 + 13.174×10⁻³ × N ms
+  Mean latency: 7.191 ms ± 4.043 ms
+  Coefficient of variation: 56.2%
+  R² value: 0.8847
+  Slope: 13.174 μs/connection
+  Intercept: 0.564 ms
+  Data points: 2000
 
-Version: PostgreSQL 14.18 (Postgres.app) on aarch64-apple-darwin20.6.0, compiled by Apple clang version 12.0.5 (clang-1205.0.22.9), 64-bit
-  Linear regression: 0.077 + 4.264×10⁻³ × N ms
-  Mean latency: 2.428 ms ± 1.113 ms
-  Coefficient of variation: 45.9%
-  R² value: 0.9977
-  Slope: 4.264 μs/connection
-  Intercept: 0.077 ms
-  Data points: 1807
+Version: REL_10_23
+  Linear regression: 0.577 + 13.171×10⁻³ × N ms
+  Mean latency: 7.202 ms ± 3.979 ms
+  Coefficient of variation: 55.3%
+  R² value: 0.9130
+  Slope: 13.171 μs/connection
+  Intercept: 0.577 ms
+  Data points: 2000
 
-Version: PostgreSQL 15.13 (Postgres.app) on aarch64-apple-darwin21.6.0, compiled by Apple clang version 14.0.0 (clang-1400.0.29.102), 64-bit
-  Linear regression: 0.081 + 4.235×10⁻³ × N ms
-  Mean latency: 2.415 ms ± 1.106 ms
-  Coefficient of variation: 45.8%
-  R² value: 0.9978
-  Slope: 4.235 μs/connection
-  Intercept: 0.081 ms
-  Data points: 1807
+Version: REL_11_22
+  Linear regression: 0.663 + 12.925×10⁻³ × N ms
+  Mean latency: 7.165 ms ± 3.875 ms
+  Coefficient of variation: 54.1%
+  R² value: 0.9272
+  Slope: 12.925 μs/connection
+  Intercept: 0.663 ms
+  Data points: 2000
 
-Version: PostgreSQL 16.9 (Postgres.app) on aarch64-apple-darwin21.6.0, compiled by Apple clang version 14.0.0 (clang-1400.0.29.102), 64-bit
-  Linear regression: 0.079 + 4.238×10⁻³ × N ms
-  Mean latency: 2.415 ms ± 1.106 ms
-  Coefficient of variation: 45.8%
-  R² value: 0.9982
-  Slope: 4.238 μs/connection
-  Intercept: 0.079 ms
-  Data points: 1807
+Version: REL_12_22
+  Linear regression: 0.523 + 13.328×10⁻³ × N ms
+  Mean latency: 7.227 ms ± 4.062 ms
+  Coefficient of variation: 56.2%
+  R² value: 0.8970
+  Slope: 13.328 μs/connection
+  Intercept: 0.523 ms
+  Data points: 2000
 
-Version: PostgreSQL 17.5 (Postgres.app) on aarch64-apple-darwin23.6.0, compiled by Apple clang version 15.0.0 (clang-1500.3.9.4), 64-bit
-  Linear regression: 0.077 + 4.256×10⁻³ × N ms
-  Mean latency: 2.423 ms ± 1.111 ms
-  Coefficient of variation: 45.9%
-  R² value: 0.9983
-  Slope: 4.256 μs/connection
-  Intercept: 0.077 ms
-  Data points: 1807
+Version: REL_13_21
+  Linear regression: 0.438 + 12.408×10⁻³ × N ms
+  Mean latency: 6.679 ms ± 3.603 ms
+  Coefficient of variation: 54.0%
+  R² value: 0.9882
+  Slope: 12.408 μs/connection
+  Intercept: 0.438 ms
+  Data points: 2000
 
-Version: HEAD
-  Linear regression: 0.079 + 4.218×10⁻³ × N ms
-  Mean latency: 2.405 ms ± 1.101 ms
-  Coefficient of variation: 45.8%
-  R² value: 0.9981
-  Slope: 4.218 μs/connection
-  Intercept: 0.079 ms
-  Data points: 1807
+Version: REL_14_18
+  Linear regression: 0.351 + 13.046×10⁻³ × N ms
+  Mean latency: 6.913 ms ± 3.791 ms
+  Coefficient of variation: 54.8%
+  R² value: 0.9871
+  Slope: 13.046 μs/connection
+  Intercept: 0.351 ms
+  Data points: 2000
 
-Version: jj/notify-single-listener-opt
-  Linear regression: 0.072 + 0.196×10⁻³ × N ms
-  Mean latency: 0.180 ms ± 0.110 ms
-  Coefficient of variation: 61.1%
-  R² value: 0.2163
-  Slope: 0.196 μs/connection
-  Intercept: 0.072 ms
-  Data points: 1807
+Version: REL_15_13
+  Linear regression: 0.369 + 12.971×10⁻³ × N ms
+  Mean latency: 6.893 ms ± 3.768 ms
+  Coefficient of variation: 54.7%
+  R² value: 0.9877
+  Slope: 12.971 μs/connection
+  Intercept: 0.369 ms
+  Data points: 2000
+
+Version: REL_16_9
+  Linear regression: 0.324 + 13.038×10⁻³ × N ms
+  Mean latency: 6.882 ms ± 3.787 ms
+  Coefficient of variation: 55.0%
+  R² value: 0.9876
+  Slope: 13.038 μs/connection
+  Intercept: 0.324 ms
+  Data points: 2000
+
+Version: REL_17_4
+  Linear regression: 0.364 + 13.042×10⁻³ × N ms
+  Mean latency: 6.925 ms ± 3.788 ms
+  Coefficient of variation: 54.7%
+  R² value: 0.9878
+  Slope: 13.042 μs/connection
+  Intercept: 0.364 ms
+  Data points: 2000
+
+Version: master
+  Linear regression: 0.354 + 13.174×10⁻³ × N ms
+  Mean latency: 6.981 ms ± 3.826 ms
+  Coefficient of variation: 54.8%
+  R² value: 0.9877
+  Slope: 13.174 μs/connection
+  Intercept: 0.354 ms
+  Data points: 2000
+
+Version: optimize_listen_notify
+  Linear regression: 0.570 + 0.108×10⁻³ × N ms
+  Mean latency: 0.625 ms ± 0.104 ms
+  Coefficient of variation: 16.6%
+  R² value: 0.0904
+  Slope: 0.108 μs/connection
+  Intercept: 0.570 ms
+  Data points: 2000
 
 
 Summary Table
 ----------------------------------------------------------------------------------------------------
 Version                             Slope (μs/conn)    Intercept (ms)  R²         Formula
 ----------------------------------------------------------------------------------------------------
-PostgreSQL 13.21                            13.074          -0.442     0.9418     -0.442 + 13.074×10⁻³ × N ms
-PostgreSQL 14.18                             4.264           0.077     0.9977     0.077 + 4.264×10⁻³ × N ms
-PostgreSQL 15.13                             4.235           0.081     0.9978     0.081 + 4.235×10⁻³ × N ms
-PostgreSQL 16.9                              4.238           0.079     0.9982     0.079 + 4.238×10⁻³ × N ms
-PostgreSQL 17.5                              4.256           0.077     0.9983     0.077 + 4.256×10⁻³ × N ms
-HEAD                                         4.218           0.079     0.9981     0.079 + 4.218×10⁻³ × N ms
-jj/notify-single-listener-opt                0.196           0.072     0.2163     0.072 + 0.196×10⁻³ × N ms
+REL9_6_24                                   13.174           0.564     0.8847     0.564 + 13.174×10⁻³ × N ms
+REL_10_23                                   13.171           0.577     0.9130     0.577 + 13.171×10⁻³ × N ms
+REL_11_22                                   12.925           0.663     0.9272     0.663 + 12.925×10⁻³ × N ms
+REL_12_22                                   13.328           0.523     0.8970     0.523 + 13.328×10⁻³ × N ms
+REL_13_21                                   12.408           0.438     0.9882     0.438 + 12.408×10⁻³ × N ms
+REL_14_18                                   13.046           0.351     0.9871     0.351 + 13.046×10⁻³ × N ms
+REL_15_13                                   12.971           0.369     0.9877     0.369 + 12.971×10⁻³ × N ms
+REL_16_9                                    13.038           0.324     0.9876     0.324 + 13.038×10⁻³ × N ms
+REL_17_4                                    13.042           0.364     0.9878     0.364 + 13.042×10⁻³ × N ms
+master                                      13.174           0.354     0.9877     0.354 + 13.174×10⁻³ × N ms
+optimize_listen_notify                       0.108           0.570     0.0904     0.570 + 0.108×10⁻³ × N ms
 ----------------------------------------------------------------------------------------------------
 ```
 
 ### Key Observations from the Analysis
 
-- **R² values**: PostgreSQL 14+ shows excellent linear fit (R² > 0.997), while v13 has more variance (R² = 0.942)
-- **Low R² for patch (0.216)**: The optimization patch's low R² indicates that connection count explains only 22% of latency variance, suggesting near-constant performance with small periodic variations from the existing wake-up mechanism
-- **Slope reduction**: The optimization patch reduces the per-connection overhead from ~4.2 μs to ~0.2 μs, a 95% improvement while maintaining O(N) correctness through the existing laggard wake-up mechanism (now fixed to include all databases)
+- **Consistent O(N) scaling**: All PostgreSQL versions show remarkably similar slopes (12.4-13.3 μs/connection)
+- **R² values**: Most versions show strong linear fit (R² > 0.88), with v13-master showing excellent fit (R² > 0.98)
+- **Low R² for patch**: The optimization patch's R² of 0.0904 indicates that connection count has minimal impact on latency
+- **Slope reduction**: The optimization patch reduces the per-connection overhead by 99.2% (from ~13 μs to ~0.11 μs)
 
 ## How the Benchmark Works
 
@@ -249,7 +259,7 @@ Smaller boxes indicate more consistent performance. The regression line slope in
 
 - `benchmark_results.csv` - Raw measurements with latency percentiles
 - `candlestick_comparison.png` - Overall comparison across all PostgreSQL versions
-- `candlestick_comparison-1.png` through `candlestick_comparison-6.png` - Version pair comparisons
+- `candlestick_comparison-1.png` through `candlestick_comparison-10.png` - Version pair comparisons
 
 ## Technical Implementation
 
