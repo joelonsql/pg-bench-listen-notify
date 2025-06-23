@@ -4,7 +4,7 @@ A benchmarking tool that measures how PostgreSQL LISTEN/NOTIFY performance scale
 
 > **⚠️ IMPORTANT DISCLAIMER**
 > 
-> The `optimize_listen_notify` patch referenced in this benchmark has **not been carefully reviewed** by experts in PostgreSQL's async.c subsystem. While the benchmark results show promising near-O(1) performance characteristics, these results might be misleading if the optimization approach has unforeseen issues or doesn't work correctly in practice. The patch must undergo thorough review and testing before any conclusions are drawn about its viability.
+> The [`optimize_listen_notify`](https://github.com/joelonsql/postgresql/commit/97a6af9d683422f52d81f951321b00fcf1e26122) patch referenced in this benchmark has **not been carefully reviewed** by experts in PostgreSQL's async.c subsystem. While the benchmark results show promising near-O(1) performance characteristics, these results might be misleading if the optimization approach has unforeseen issues or doesn't work correctly in practice. The patch must undergo thorough review and testing before any conclusions are drawn about its viability.
 
 ## Key Results
 
@@ -25,7 +25,7 @@ Our analysis reveals that all PostgreSQL versions from 9.6 through master exhibi
 | PostgreSQL 9.6-13 | O(N) | ~0.4-0.7 + 12.4-13.3×10⁻³ × N ms |
 | PostgreSQL 14-17 | O(N) | ~0.3-0.4 + 13.0-13.1×10⁻³ × N ms |
 | master | O(N) | 0.354 + 13.174×10⁻³ × N ms |
-| optimize_listen_notify | **~O(1)** | **0.570 + 0.108×10⁻³ × N ms** |
+| [`optimize_listen_notify`](https://github.com/joelonsql/postgresql/commit/97a6af9d683422f52d81f951321b00fcf1e26122) | **~O(1)** | **0.570 + 0.108×10⁻³ × N ms** |
 
 ### Understanding LISTEN/NOTIFY Latency
 
@@ -50,7 +50,7 @@ This consistency suggests that the core LISTEN/NOTIFY implementation has remaine
 
 ### The Optimization Patch: Near-O(1) Performance
 
-The `optimize_listen_notify` patch achieves a dramatic improvement:
+The [`optimize_listen_notify`](https://github.com/joelonsql/postgresql/commit/97a6af9d683422f52d81f951321b00fcf1e26122) patch achieves a dramatic improvement:
 - **Slope**: 0.108 μs/connection (120x improvement over standard PostgreSQL)
 - **R² value**: 0.0904 (connection count has minimal impact on latency)
 - **Mean latency**: 0.625 ms (remains nearly constant regardless of connection count)
@@ -166,7 +166,7 @@ Version: master
   Intercept: 0.354 ms
   Data points: 2000
 
-Version: optimize_listen_notify
+Version: [`optimize_listen_notify`](https://github.com/joelonsql/postgresql/commit/97a6af9d683422f52d81f951321b00fcf1e26122)
   Linear regression: 0.570 + 0.108×10⁻³ × N ms
   Mean latency: 0.625 ms ± 0.104 ms
   Coefficient of variation: 16.6%
@@ -190,7 +190,7 @@ REL_15_13                                   12.971           0.369     0.9877   
 REL_16_9                                    13.038           0.324     0.9876     0.324 + 13.038×10⁻³ × N ms
 REL_17_4                                    13.042           0.364     0.9878     0.364 + 13.042×10⁻³ × N ms
 master                                      13.174           0.354     0.9877     0.354 + 13.174×10⁻³ × N ms
-optimize_listen_notify                       0.108           0.570     0.0904     0.570 + 0.108×10⁻³ × N ms
+[`optimize_listen_notify`](https://github.com/joelonsql/postgresql/commit/97a6af9d683422f52d81f951321b00fcf1e26122)                       0.108           0.570     0.0904     0.570 + 0.108×10⁻³ × N ms
 ----------------------------------------------------------------------------------------------------
 ```
 
