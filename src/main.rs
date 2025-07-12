@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use libc::{rlimit, RLIMIT_NOFILE};
 use csv::Writer;
+use libc::{rlimit, RLIMIT_NOFILE};
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -14,19 +14,14 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
-const MAX_CONNECTIONS: usize = 1000;
-
-#[derive(Debug, Clone)]
-struct Measurement {
-    round_trip_ns: u128,
-    #[allow(dead_code)]
-    thread_id: usize,
-}
+// Test with exactly these numbers of extra listening connections
+const EXTRA_CONNECTION_COUNTS: &[usize] = &[0, 10, 100, 1000];
+const MEASUREMENTS_PER_CONNECTION_COUNT: usize = 3;
 
 #[derive(Debug, Clone)]
 struct BenchmarkResult {
     connection_count: usize,
-    latency_ms: f64,
+    tps: f64,
     version: String,
 }
 
@@ -39,7 +34,10 @@ async fn find_free_port() -> Result<u16> {
     anyhow::bail!("No free port found")
 }
 
-async fn setup_postgres(pg_bin_path: Option<&Path>, custom_version: Option<String>) -> Result<(TempDir, u16, String, String)> {
+async fn setup_postgres(
+    pg_bin_path: Option<&Path>,
+    custom_version: Option<String>,
+) -> Result<(TempDir, u16, String, String)> {
     // Build command paths
     let (initdb_cmd, pg_ctl_cmd, createdb_cmd) = if let Some(bin_path) = pg_bin_path {
         (
@@ -56,7 +54,11 @@ async fn setup_postgres(pg_bin_path: Option<&Path>, custom_version: Option<Strin
     };
 
     // Check for PostgreSQL tools
-    for (tool_name, tool_path) in &[("initdb", &initdb_cmd), ("pg_ctl", &pg_ctl_cmd), ("createdb", &createdb_cmd)] {
+    for (tool_name, tool_path) in &[
+        ("initdb", &initdb_cmd),
+        ("pg_ctl", &pg_ctl_cmd),
+        ("createdb", &createdb_cmd),
+    ] {
         Command::new(tool_path)
             .arg("--version")
             .output()
@@ -98,7 +100,15 @@ async fn setup_postgres(pg_bin_path: Option<&Path>, custom_version: Option<Strin
 max_connections = 2000
 shared_buffers = 32GB
 work_mem = 1MB
-maintenance_work_mem = 256MB
+autovacuum = off
+
+# Connection logging settings
+# log_connections = on
+# log_disconnections = on
+# log_statement = 'all'
+# log_min_messages = debug1
+# trace_notify = on
+
 "#;
 
     file.write_all(config_settings.as_bytes())
@@ -111,14 +121,17 @@ maintenance_work_mem = 256MB
         .arg("-D")
         .arg(&data_dir)
         .arg("-l")
-        .arg(temp_dir.path().join("logfile"))
+        .arg("/tmp/pg.log")
         .arg("-o")
         .arg(format!("-p {}", port))
         .arg("start")
         .output()?;
 
     if !output.status.success() {
-        anyhow::bail!("pg_ctl start failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "pg_ctl start failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Wait for PostgreSQL to start
@@ -134,10 +147,17 @@ maintenance_work_mem = 256MB
         .output()?;
 
     if !output.status.success() {
-        anyhow::bail!("createdb failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "createdb failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    let connection_string = format!("host=127.0.0.1 port={} dbname=testdb user={}", port, whoami::username());
+    let connection_string = format!(
+        "host=127.0.0.1 port={} dbname=testdb user={}",
+        port,
+        whoami::username()
+    );
 
     // Get PostgreSQL version
     let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await?;
@@ -161,7 +181,11 @@ maintenance_work_mem = 256MB
     Ok((temp_dir, port, connection_string, version))
 }
 
-async fn cleanup_postgres(data_dir: &PathBuf, _port: u16, pg_bin_path: Option<&Path>) -> Result<()> {
+async fn cleanup_postgres(
+    data_dir: &PathBuf,
+    _port: u16,
+    pg_bin_path: Option<&Path>,
+) -> Result<()> {
     let pg_ctl_cmd = if let Some(bin_path) = pg_bin_path {
         bin_path.join("pg_ctl")
     } else {
@@ -177,7 +201,10 @@ async fn cleanup_postgres(data_dir: &PathBuf, _port: u16, pg_bin_path: Option<&P
         .output()?;
 
     if !output.status.success() {
-        eprintln!("Warning: pg_ctl stop failed: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "Warning: pg_ctl stop failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(())
@@ -186,9 +213,10 @@ async fn cleanup_postgres(data_dir: &PathBuf, _port: u16, pg_bin_path: Option<&P
 async fn create_listener_thread(
     thread_id: usize,
     connection_string: String,
-    tx: mpsc::Sender<Measurement>,
     ready: Arc<AtomicBool>,
     other_ready: Arc<AtomicBool>,
+    round_trip_counter: Arc<AtomicU64>,
+    stop_flag: Arc<AtomicBool>,
 ) -> Result<JoinHandle<Result<()>>> {
     let handle = tokio::spawn(async move {
         let (client, mut connection) = tokio_postgres::connect(&connection_string, NoTls).await?;
@@ -217,7 +245,9 @@ async fn create_listener_thread(
 
         // Listen on our channel
         let channel_name = format!("thread_{}", thread_id);
-        client.execute(&format!("LISTEN {}", channel_name), &[]).await?;
+        client
+            .execute(&format!("LISTEN {}", channel_name), &[])
+            .await?;
 
         // Signal that we're ready
         ready.store(true, Ordering::SeqCst);
@@ -230,38 +260,61 @@ async fn create_listener_thread(
         // Thread 1 initiates the ping-pong
         if thread_id == 1 {
             sleep(Duration::from_millis(100)).await;
-            client.execute("SELECT pg_notify('thread_2', NULL)", &[]).await?;
+            let initial_notify = "SELECT pg_notify('thread_2', NULL)";
+            client.execute(initial_notify, &[]).await?;
         }
 
         // Main notification loop
-        let mut start_time = Instant::now();
-
+        let mut notification_count = 0;
         while let Some(notification) = rx_notif.recv().await {
-            let elapsed = start_time.elapsed();
+            notification_count += 1;
 
-            // Send measurement
-            tx.send(Measurement {
-                round_trip_ns: elapsed.as_nanos(),
-                thread_id,
-            }).await?;
+            // Check if we should stop
+            if stop_flag.load(Ordering::SeqCst) {
+                println!(
+                    "Thread {} stopping after {} notifications",
+                    thread_id, notification_count
+                );
+                break;
+            }
+
+            // Increment round-trip counter (only count on one thread to avoid double counting)
+            if thread_id == 1 {
+                let current_count = round_trip_counter.fetch_add(1, Ordering::SeqCst);
+                if current_count % 10000 == 0 && current_count > 0 {
+                    println!("Thread 1 processed {} round-trips", current_count);
+                }
+            }
 
             // Verify notification
             let expected_channel = format!("thread_{}", thread_id);
             if notification.channel() != expected_channel {
-                anyhow::bail!("Unexpected channel: {} (expected {})", notification.channel(), expected_channel);
+                anyhow::bail!(
+                    "Unexpected channel: {} (expected {})",
+                    notification.channel(),
+                    expected_channel
+                );
             }
             if !notification.payload().is_empty() {
-                anyhow::bail!("Unexpected payload: {} (expected empty)", notification.payload());
+                anyhow::bail!(
+                    "Unexpected payload: {} (expected empty)",
+                    notification.payload()
+                );
             }
-
-            // Record new start time before sending notification
-            start_time = Instant::now();
 
             // Send notification to the other thread
             let other_thread = if thread_id == 1 { 2 } else { 1 };
-            client.execute(&format!("SELECT pg_notify('thread_{}', NULL)", other_thread), &[]).await?;
+            let notify_cmd = format!("SELECT pg_notify('thread_{}', NULL)", other_thread);
+            if let Err(e) = client.execute(&notify_cmd, &[]).await {
+                eprintln!("Thread {} failed to send notification: {}", thread_id, e);
+                break;
+            }
         }
 
+        println!(
+            "Thread {} exiting after {} notifications",
+            thread_id, notification_count
+        );
         Ok(())
     });
 
@@ -284,7 +337,10 @@ async fn create_idle_listener(
 
                 // Listen on our channel
                 let channel_name = format!("thread_{}", thread_id);
-                match client.execute(&format!("LISTEN {}", channel_name), &[]).await {
+                match client
+                    .execute(&format!("LISTEN {}", channel_name), &[])
+                    .await
+                {
                     Ok(_) => {
                         // Remain idle
                         loop {
@@ -313,25 +369,12 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut pg_bin_path = None;
     let mut output_file = "stats.csv";
-    let mut increment = 1;
     let mut custom_version = None;
 
     // Simple argument parsing
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--increment" => {
-                if i + 1 < args.len() {
-                    increment = args[i + 1].parse::<usize>()
-                        .context("Invalid increment value")?;
-                    if increment == 0 {
-                        anyhow::bail!("Increment must be greater than 0");
-                    }
-                    i += 2;
-                } else {
-                    anyhow::bail!("--increment requires a value");
-                }
-            }
             "--version-name" => {
                 if i + 1 < args.len() {
                     custom_version = Some(args[i + 1].clone());
@@ -358,7 +401,6 @@ async fn main() -> Result<()> {
     if let Some(ref version) = custom_version {
         println!("Using custom version name: {}", version);
     }
-    println!("Connection increment: {} per measurement", increment);
 
     // Check and increase OS limits
     println!("Checking and adjusting OS limits...");
@@ -371,17 +413,20 @@ async fn main() -> Result<()> {
 
     unsafe {
         if libc::getrlimit(RLIMIT_NOFILE, &mut rlim) == 0 {
-            println!("Current file descriptor limit: soft={}, hard={}", rlim.rlim_cur, rlim.rlim_max);
+            println!(
+                "Current file descriptor limit: soft={}, hard={}",
+                rlim.rlim_cur, rlim.rlim_max
+            );
 
-            // Try to set to a high value (3 times MAX_CONNECTIONS should be enough)
-            let new_limit = (MAX_CONNECTIONS * 3) as u64;
-            rlim.rlim_cur = new_limit;
-            if rlim.rlim_max < new_limit {
-                rlim.rlim_max = new_limit;
+            // Try to set to 65536 (equivalent to ulimit -n 65536)
+            let target_limit = 65536u64;
+            rlim.rlim_cur = target_limit;
+            if rlim.rlim_max < target_limit {
+                rlim.rlim_max = target_limit;
             }
 
             if libc::setrlimit(RLIMIT_NOFILE, &rlim) == 0 {
-                println!("Successfully set file descriptor limit to {}", new_limit);
+                println!("Successfully set file descriptor limit to {}", target_limit);
             } else {
                 // If that fails, try just setting to the hard limit
                 rlim.rlim_cur = rlim.rlim_max;
@@ -389,44 +434,19 @@ async fn main() -> Result<()> {
                     println!("Set file descriptor limit to hard limit: {}", rlim.rlim_max);
                 } else {
                     eprintln!("Warning: Could not increase file descriptor limit");
+                    eprintln!("You may need to run: ulimit -n 65536");
                 }
             }
 
             // Verify the new limit
             if libc::getrlimit(RLIMIT_NOFILE, &mut rlim) == 0 {
-                println!("New file descriptor limit: soft={}, hard={}", rlim.rlim_cur, rlim.rlim_max);
+                println!(
+                    "New file descriptor limit: soft={}, hard={}",
+                    rlim.rlim_cur, rlim.rlim_max
+                );
             }
         }
     }
-
-    println!("Setting up PostgreSQL...");
-    let (temp_dir, port, connection_string, pg_version) = setup_postgres(pg_bin_path, custom_version).await?;
-    let data_dir = temp_dir.path().join("data");
-
-    println!("PostgreSQL started on port {}", port);
-
-    // Create monitoring connection
-    let (monitor_client, monitor_connection) = tokio_postgres::connect(&connection_string, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = monitor_connection.await {
-            eprintln!("Monitor connection error: {}", e);
-        }
-    });
-
-    // Verify max_connections setting
-    let row = monitor_client.query_one("SHOW max_connections", &[]).await?;
-    let max_conn: &str = row.get(0);
-    println!("PostgreSQL max_connections: {}", max_conn);
-
-    // Check other connection limits
-    let row = monitor_client.query_one("SHOW superuser_reserved_connections", &[]).await?;
-    let reserved: &str = row.get(0);
-    println!("PostgreSQL superuser_reserved_connections: {}", reserved);
-
-    // Also check shared_buffers as it affects max connections
-    let row = monitor_client.query_one("SHOW shared_buffers", &[]).await?;
-    let shared_buffers: &str = row.get(0);
-    println!("PostgreSQL shared_buffers: {}", shared_buffers);
 
     // Create or append to CSV file
     let file_exists = std::path::Path::new(output_file).exists();
@@ -438,121 +458,244 @@ async fn main() -> Result<()> {
 
     // Write header only if file is new
     if !file_exists {
-        csv_writer.write_record(&[
-            "connections", "latency_ms", "version"
-        ])?;
+        csv_writer.write_record(&["connections", "tps", "version"])?;
     }
 
-    // Create channels for measurements
-    let (tx, mut rx) = mpsc::channel::<Measurement>(1000);
-
-    // Create ready flags
-    let thread1_ready = Arc::new(AtomicBool::new(false));
-    let thread2_ready = Arc::new(AtomicBool::new(false));
-
-    // Start listener threads
-    println!("Starting listener threads...");
-    let _thread1 = create_listener_thread(
-        1,
-        connection_string.clone(),
-        tx.clone(),
-        thread1_ready.clone(),
-        thread2_ready.clone(),
-    ).await?;
-
-    let _thread2 = create_listener_thread(
-        2,
-        connection_string.clone(),
-        tx.clone(),
-        thread2_ready.clone(),
-        thread1_ready.clone(),
-    ).await?;
-
-    // Wait for both threads to be ready
-    while !thread1_ready.load(Ordering::SeqCst) || !thread2_ready.load(Ordering::SeqCst) {
-        sleep(Duration::from_millis(10)).await;
-    }
-
-    println!("Threads ready, starting measurements...");
-
-    let mut idle_threads = Vec::new();
-    let mut next_thread_id = 3;
-    let mut measurement_count = 0;
     let mut benchmark_results: Vec<BenchmarkResult> = Vec::new();
 
-    // Main measurement loop
-    loop {
-        if let Ok(measurement) = rx.try_recv() {
-            let connection_count = 3 + idle_threads.len(); // 2 threads + 1 monitor
-            let latency_ms = measurement.round_trip_ns as f64 / 1_000_000.0;
+    // Test each connection count
+    for &extra_connections in EXTRA_CONNECTION_COUNTS {
+        for measurement_run in 1..=MEASUREMENTS_PER_CONNECTION_COUNT {
+            println!("\n========================================");
+            println!(
+                "Testing with {} extra connections - Run {}/{}",
+                extra_connections,
+                measurement_run,
+                MEASUREMENTS_PER_CONNECTION_COUNT
+            );
+            println!("========================================");
 
-            // Store measurement for later CSV writing
+            // Setup PostgreSQL for this test run
+            println!("Setting up PostgreSQL for this test run...");
+            let (temp_dir, port, connection_string, pg_version) =
+                setup_postgres(pg_bin_path, custom_version.clone()).await?;
+            let data_dir = temp_dir.path().join("data");
+
+            println!("PostgreSQL started on port {}", port);
+            println!("Data directory: {:?}", data_dir);
+            println!("Connection string: {}", connection_string);
+            println!("PostgreSQL version: {}", pg_version);
+
+            // Create monitoring connection
+            println!("Creating monitoring connection...");
+            let (monitor_client, monitor_connection) =
+                tokio_postgres::connect(&connection_string, NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(e) = monitor_connection.await {
+                    eprintln!("Monitor connection error: {}", e);
+                }
+            });
+
+            // Verify max_connections setting
+            let row = monitor_client
+                .query_one("SHOW max_connections", &[])
+                .await?;
+            let max_conn: &str = row.get(0);
+            println!("PostgreSQL max_connections: {}", max_conn);
+
+            // Check other connection limits
+            let row = monitor_client
+                .query_one("SHOW superuser_reserved_connections", &[])
+                .await?;
+            let reserved: &str = row.get(0);
+            println!("PostgreSQL superuser_reserved_connections: {}", reserved);
+
+            // Also check shared_buffers as it affects max connections
+            let row = monitor_client.query_one("SHOW shared_buffers", &[]).await?;
+            let shared_buffers: &str = row.get(0);
+            println!("PostgreSQL shared_buffers: {}", shared_buffers);
+
+            println!("Manual connection test command:");
+            println!("  psql '{}'", connection_string);
+
+            let total_connections = 3 + extra_connections; // 2 ping-pong threads + 1 monitor + extra listeners
+
+            println!("\n========================================");
+            println!(
+                "Testing with {} extra connections ({} total) - Run {}/{}",
+                extra_connections,
+                total_connections,
+                measurement_run,
+                MEASUREMENTS_PER_CONNECTION_COUNT
+            );
+            println!("Connection string: {}", connection_string);
+            println!("Test plan:");
+            println!("  - 2 ping-pong threads (thread_1, thread_2)");
+            println!("  - 1 monitor connection");
+            println!(
+                "  - {} idle listener threads (thread_3 to thread_{})",
+                extra_connections,
+                3 + extra_connections - 1
+            );
+            println!("========================================");
+
+            // Create ready flags and counters
+            let thread1_ready = Arc::new(AtomicBool::new(false));
+            let thread2_ready = Arc::new(AtomicBool::new(false));
+            let round_trip_counter = Arc::new(AtomicU64::new(0));
+            let stop_flag = Arc::new(AtomicBool::new(false));
+
+            // Start listener threads
+            println!("Starting ping-pong threads...");
+            let _thread1 = create_listener_thread(
+                1,
+                connection_string.clone(),
+                thread1_ready.clone(),
+                thread2_ready.clone(),
+                round_trip_counter.clone(),
+                stop_flag.clone(),
+            )
+            .await?;
+
+            let _thread2 = create_listener_thread(
+                2,
+                connection_string.clone(),
+                thread2_ready.clone(),
+                thread1_ready.clone(),
+                round_trip_counter.clone(),
+                stop_flag.clone(),
+            )
+            .await?;
+
+            // Wait for both threads to be ready
+            while !thread1_ready.load(Ordering::SeqCst) || !thread2_ready.load(Ordering::SeqCst) {
+                sleep(Duration::from_millis(10)).await;
+            }
+
+            // Create idle listener connections
+            let mut idle_threads = Vec::new();
+            println!(
+                "Creating {} idle listener connections...",
+                extra_connections
+            );
+            for thread_id in 3..(3 + extra_connections) {
+                println!("Creating idle listener thread {}", thread_id);
+                match create_idle_listener(connection_string.clone(), thread_id).await {
+                    Ok(idle_thread) => {
+                        idle_threads.push(idle_thread);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create idle listener {}: {}", thread_id, e);
+                        break;
+                    }
+                }
+            }
+
+            // Wait a bit for all connections to be established
+            println!("Waiting 500ms for all connections to be established...");
+            sleep(Duration::from_millis(500)).await;
+
+            // Check if ping-pong is still active before warm-up
+            println!("Checking ping-pong activity...");
+            let pre_warmup_count = round_trip_counter.load(Ordering::SeqCst);
+            sleep(Duration::from_millis(100)).await;
+            let post_check_count = round_trip_counter.load(Ordering::SeqCst);
+
+            if post_check_count > pre_warmup_count {
+                println!(
+                    "Ping-pong is active: {} round-trips during 100ms check",
+                    post_check_count - pre_warmup_count
+                );
+            } else {
+                println!("WARNING: Ping-pong appears to be stalled before warm-up!");
+                println!("Manual test commands:");
+                println!("  psql '{}' -c \"LISTEN thread_1;\"", connection_string);
+                println!("  psql '{}' -c \"LISTEN thread_2;\"", connection_string);
+                println!(
+                    "  psql '{}' -c \"SELECT pg_notify('thread_2', NULL);\"",
+                    connection_string
+                );
+                println!(
+                    "  psql '{}' -c \"SELECT pg_notify('thread_1', NULL);\"",
+                    connection_string
+                );
+            }
+
+            // Warm-up period (1 second)
+            println!("Starting 1-second warm-up period...");
+            sleep(Duration::from_secs(1)).await;
+
+            // Check if ping-pong is still active after warm-up
+            let pre_reset_count = round_trip_counter.load(Ordering::SeqCst);
+            println!(
+                "Ping-pong completed {} round-trips during warm-up",
+                pre_reset_count
+            );
+
+            // Reset counter after warm-up
+            round_trip_counter.store(0, Ordering::SeqCst);
+
+            // Start timing for TPS measurement
+            println!("Starting 10-second TPS measurement...");
+            let start_time = Instant::now();
+
+            // Check periodically if ping-pong is active
+            for i in 0..10 {
+                sleep(Duration::from_secs(1)).await;
+                let current_count = round_trip_counter.load(Ordering::SeqCst);
+                if i == 0 && current_count == 0 {
+                    println!("WARNING: No round-trips detected in first second!");
+                }
+                if i % 2 == 0 {
+                    println!("After {} seconds: {} round-trips", i + 1, current_count);
+                }
+            }
+
+            // Stop the ping-pong
+            stop_flag.store(true, Ordering::SeqCst);
+
+            let elapsed = start_time.elapsed();
+            let round_trips = round_trip_counter.load(Ordering::SeqCst);
+            let tps = round_trips as f64 / elapsed.as_secs_f64();
+
+            println!(
+                "Completed {} round-trips in {:.2} seconds",
+                round_trips,
+                elapsed.as_secs_f64()
+            );
+            println!("TPS: {:.2}", tps);
+
+            // Store result
             benchmark_results.push(BenchmarkResult {
-                connection_count,
-                latency_ms,
+                connection_count: extra_connections,
+                tps,
                 version: pg_version.clone(),
             });
 
-            measurement_count += 1;
+            // Clean up threads (they should exit naturally due to stop_flag)
+            sleep(Duration::from_millis(100)).await;
 
-            // Print progress every 20 measurements
-            if measurement_count % 20 == 0 {
-                println!("Connections: {:5}, Latest latency: {:7.2}ms (measurement {})", 
-                         connection_count, latency_ms, measurement_count);
-            }
-
-            // Add new connections every 20 measurements
-            if measurement_count % 20 == 0 {
-                // Create new idle listeners based on increment
-                let mut added = 0;
-                for _ in 0..increment {
-                    if idle_threads.len() >= MAX_CONNECTIONS {
-                        break;
-                    }
-                    match create_idle_listener(connection_string.clone(), next_thread_id).await {
-                        Ok(idle_thread) => {
-                            idle_threads.push(idle_thread);
-                            next_thread_id += 1;
-                            added += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to create idle listener {}: {}", next_thread_id, e);
-                            eprintln!("Connection string: {}", connection_string);
-                            break;
-                        }
-                    }
-                }
-
-                if added > 0 && added < increment && idle_threads.len() < MAX_CONNECTIONS {
-                    eprintln!("Warning: Only added {} connections instead of {}", added, increment);
-                }
-
-                // Stop when we reach MAX_CONNECTIONS connections
-                if idle_threads.len() >= MAX_CONNECTIONS {
-                    println!("Reached {} idle connections, stopping...", MAX_CONNECTIONS);
-                    break;
-                }
-            }
-        } else {
-            sleep(Duration::from_millis(1)).await;
+            // Cleanup PostgreSQL for this test run
+            println!("Cleaning up PostgreSQL for this test run...");
+            cleanup_postgres(&data_dir, port, pg_bin_path).await?;
+            println!("PostgreSQL cleanup complete.");
         }
     }
 
     // Write all collected measurements to CSV
-    println!("Writing {} measurements to CSV...", benchmark_results.len());
+    println!(
+        "\nWriting {} measurements to CSV...",
+        benchmark_results.len()
+    );
     for result in benchmark_results {
         csv_writer.write_record(&[
             result.connection_count.to_string(),
-            format!("{:.2}", result.latency_ms),
+            format!("{:.2}", result.tps),
             result.version,
         ])?;
     }
     csv_writer.flush()?;
     println!("CSV writing complete.");
-
-    // Cleanup
-    println!("Cleaning up...");
-    cleanup_postgres(&data_dir, port, pg_bin_path).await?;
 
     Ok(())
 }

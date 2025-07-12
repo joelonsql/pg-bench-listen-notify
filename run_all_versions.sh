@@ -16,15 +16,6 @@ fi
 
 # Define PostgreSQL versions from user's home directory
 declare -a PG_VERSIONS=(
-    "REL9_6_24"
-    "REL_10_23"
-    "REL_11_22"
-    "REL_12_22"
-    "REL_13_21"
-    "REL_14_18"
-    "REL_15_13"
-    "REL_16_9"
-    "REL_17_4"
     "master"
     "optimize_listen_notify"
 )
