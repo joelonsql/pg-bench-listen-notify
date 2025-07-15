@@ -1,0 +1,13 @@
+pgbench (19devel)
+transaction type: listen_notify_unique.sql
+scaling factor: 1
+query mode: simple
+number of clients: 1000
+number of threads: 32
+maximum number of tries: 1
+duration: 3 s
+number of transactions actually processed: 8803
+number of failed transactions: 0 (0.000%)
+latency average = 342.838 ms
+initial connection time = 236.264 ms
+tps = 2916.829440 (without initial connection time)

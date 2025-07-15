@@ -75,5 +75,84 @@ def main():
     plt.tight_layout()
     plt.savefig('plot.png', dpi=300, bbox_inches='tight')
 
+def format_tps_with_stddev(mean_tps, std_tps):
+    """Format TPS with standard deviation."""
+    return f"{mean_tps:.2f} ± {std_tps:.2f}"
+
+def format_percentage_change(baseline_tps, current_tps, baseline_std, current_std):
+    """Format percentage change with error propagation."""
+    pct_change = ((current_tps - baseline_tps) / baseline_tps) * 100
+
+    # Error propagation for percentage change
+    # δ(%) = 100 * sqrt((δcurrent/baseline)² + (current*δbaseline/baseline²)²)
+    if baseline_tps != 0:
+        error = 100 * np.sqrt((current_std/baseline_tps)**2 + (current_tps*baseline_std/baseline_tps**2)**2)
+        return f"{pct_change:+.1f}% ± {error:.1f}%"
+    else:
+        return "N/A"
+
+def generate_table():
+    """Generate ASCII table showing benchmark results with master as baseline."""
+    # Read the CSV file
+    df = pd.read_csv('benchmark_results.csv')
+
+    # Group by connections and version, calculate mean and std
+    grouped = df.groupby(['connections', 'version'])['tps'].agg(['mean', 'std']).reset_index()
+
+    # Get unique connections and versions
+    connections = sorted(df['connections'].unique())
+    versions = df['version'].unique()
+
+    # Ensure master is first
+    if 'master' in versions:
+        versions = ['master'] + [v for v in versions if v != 'master']
+
+    print("Database Performance Comparison")
+    print("=" * 80)
+    print()
+
+    for conn in connections:
+        print(f"Connections: {conn}")
+        print("-" * 60)
+
+        # Get data for this connection level
+        conn_data = grouped[grouped['connections'] == conn]
+
+        # Find master baseline for this connection level
+        master_data = conn_data[conn_data['version'] == 'master']
+        if len(master_data) > 0:
+            master_tps = master_data['mean'].iloc[0]
+            master_std = master_data['std'].iloc[0]
+        else:
+            master_tps = None
+            master_std = None
+
+        # Print header
+        print(f"{'Version':<25} {'TPS (mean ± std)':<25} {'vs Master':<20}")
+        print("-" * 70)
+
+        # Print each version
+        for version in versions:
+            version_data = conn_data[conn_data['version'] == version]
+
+            if len(version_data) > 0:
+                mean_tps = version_data['mean'].iloc[0]
+                std_tps = version_data['std'].iloc[0]
+
+                tps_str = format_tps_with_stddev(mean_tps, std_tps)
+
+                if version == 'master':
+                    change_str = "baseline"
+                elif master_tps is not None:
+                    change_str = format_percentage_change(master_tps, mean_tps, master_std, std_tps)
+                else:
+                    change_str = "N/A"
+
+                print(f"{version:<25} {tps_str:<25} {change_str:<20}")
+
+        print()
+
 if __name__ == "__main__":
     main()
+    print("\n" + "="*80 + "\n")
+    generate_table()

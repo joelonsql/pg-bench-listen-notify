@@ -1,0 +1,2 @@
+test_type,clients,jobs,version,run_number,scaling_factor,num_clients,num_threads,duration,transactions_processed,failed_transactions,latency_avg,initial_connection_time,tps,transaction_type
+listen_notify_common,32,32,optimize_listen_notify,1,1,32,32,3,77253,0,1.251,7.128,25588.919782,listen_notify_common.sql

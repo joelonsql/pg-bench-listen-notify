@@ -17,7 +17,8 @@ fi
 # Define PostgreSQL versions from user's home directory
 declare -a PG_VERSIONS=(
     "master"
-    "optimize_listen_notify"
+    "patch-v1"
+    "patch-v2"
 )
 
 # Run benchmark for each version
