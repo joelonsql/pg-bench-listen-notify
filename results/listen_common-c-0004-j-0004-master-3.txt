@@ -6,8 +6,8 @@ number of clients: 4
 number of threads: 4
 maximum number of tries: 1
 duration: 3 s
-number of transactions actually processed: 727158
+number of transactions actually processed: 734604
 number of failed transactions: 0 (0.000%)
-latency average = 0.017 ms
-initial connection time = 1.731 ms
-tps = 242032.954597 (without initial connection time)
+latency average = 0.016 ms
+initial connection time = 1.647 ms
+tps = 244432.014763 (without initial connection time)

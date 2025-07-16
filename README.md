@@ -7,8 +7,7 @@ A benchmarking tool that measures PostgreSQL LISTEN/NOTIFY performance by compar
 > The patches referenced in this benchmark have **not been carefully reviewed** yet by experts in PostgreSQL's async.c subsystem. While the benchmark results show promising performance characteristics, these results might be misleading if the optimization approach has unforeseen issues or doesn't work correctly in practice. The patches must undergo thorough review and testing before any conclusions are drawn about their viability.
 >
 > **Patches:**
-> - [patch-v1: Optimize LISTEN/NOTIFY signaling for single-listener channels](https://github.com/joelonsql/postgresql/commit/aba0ffb2a9e1c5d77393a92c0ce43a968c23cbb5)
-> - [patch-v2: Partition channel hash to improve LISTEN/UNLISTEN](https://github.com/joelonsql/postgresql/commit/61ab3b3a834192b0468d10ca5fe3824b1fec6065)
+> - [patch-v3: Optimize LISTEN/NOTIFY signaling for scalability](https://github.com/joelonsql/postgresql/commit/18004e66974fc9d4a93e00b0183959ac306c7218)
 
 ## Key Results
 
@@ -54,8 +53,7 @@ The benchmark script expects PostgreSQL installations in specific locations in y
 ```bash
 # Expected directory structure:
 ~/pg-master/bin/                    # Baseline PostgreSQL master branch
-~/pg-patch-v1/bin/
-~/pg-patch-v2/bin/
+~/pg-patch-v3/bin/
 ```
 
 ## Quick Start

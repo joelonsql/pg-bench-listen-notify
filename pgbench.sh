@@ -3,8 +3,8 @@
 # Function to run benchmarks for all versions in randomized order
 run_benchmarks() {
     # Define version parameters
-    local versions=("master" "patch-v1" "patch-v2")
-    local output_files=("master" "optimize_listen_notify" "optimize_listen_notify_v2")
+    local versions=("master" "patch-v3")
+    local output_files=("master" "optimize_listen_notify_v3")
 
     # Define benchmark parameters
     local sql_scripts=(
@@ -16,7 +16,7 @@ run_benchmarks() {
         "listen_unique.sql"
     )
 
-    local runs=(1 2 3 4 5)
+    local runs=(0 1 2 3 4 5 6 7 8 9)
     local job_counts=(1 2 4 8 16 32)
 
     # Generate all combinations

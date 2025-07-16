@@ -1,2 +1,2 @@
 test_type,clients,jobs,version,run_number,scaling_factor,num_clients,num_threads,duration,transactions_processed,failed_transactions,latency_avg,initial_connection_time,tps,transaction_type
-listen_unlisten_common,16,16,master,3,1,16,16,3,427778,0,0.112,3.877,142729.877656,listen_unlisten_common.sql
+listen_unlisten_common,16,16,master,3,1,16,16,3,424715,0,0.113,4.15,141673.151868,listen_unlisten_common.sql

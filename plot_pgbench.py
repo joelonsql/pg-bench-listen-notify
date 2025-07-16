@@ -46,14 +46,14 @@ COL_TPS = 'tps'
 # Plot configuration
 PLOT_CONFIGS = {
     "connections_equal_jobs": {
-        "title_suffix": "Connections = Jobs",
+        "title_suffix": "pgbench -f $script -c $jobs -j $jobs -T 3 -n",
         "filename": "performance_overview_connections_equal_jobs.png",
-        "x_label": "Number of Clients (= Jobs)"
+        "x_label": "$jobs"
     },
     "fixed_connections": {
-        "title_suffix": f"Connections = {FIXED_CONNECTIONS_COUNT}, Jobs Varying",
+        "title_suffix": f"pgbench -f \$script -c {FIXED_CONNECTIONS_COUNT} -j \$jobs -T 3 -n",
         "filename": "performance_overview_fixed_connections.png",
-        "x_label": f"Number of Jobs (Connections = {FIXED_CONNECTIONS_COUNT})"
+        "x_label": "$jobs"
     }
 }
 
@@ -66,14 +66,13 @@ TEST_LAYOUT = [
 # Plot styling
 FIGURE_SIZE = (20, 12)
 GRID_SHAPE = (2, 3)
-SCATTER_SIZE = 40
-AVERAGE_MARKER_SIZE = 60
+SCATTER_SIZE = 20
 LINE_WIDTH = 2
 ANNOTATION_FONT_SIZE = 8
 TITLE_FONT_SIZE = 16
-X_OFFSET_MULTIPLIER = 0.02
 Y_AXIS_PADDING = 0.8  # For log scale min
 Y_AXIS_PADDING_MAX = 1.2  # For log scale max
+ALPHA_VALUE = 0.5  # Transparency for plots
 
 # Set style for better plots
 plt.style.use('default')
@@ -144,58 +143,48 @@ def plot_version_data(ax, version_data, test_data, version, color, x_col, versio
     individual_data = test_data[test_data[COL_VERSION] == version].copy()
     individual_data = individual_data.sort_values(x_col)
 
-    x_positions_avg = []
-    y_positions_avg = []
+    x_positions_max = []
+    y_positions_max = []
+    first_scatter = True  # Flag to add label only once
 
-    for _, avg_row in version_data.iterrows():
-        x_val = avg_row[x_col]
-        avg_tps = avg_row[COL_TPS]
-
-        # Calculate offset for visibility
-        x_offset = x_val * X_OFFSET_MULTIPLIER * (version_index - num_versions/2)
-        x_positions_avg.append(x_val + x_offset)
-        y_positions_avg.append(avg_tps)
+    for _, row in version_data.iterrows():
+        x_val = row[x_col]
+        avg_tps = row[COL_TPS]  # This is still the mean from the grouped data
 
         # Get individual points
         individual_points = individual_data[individual_data[x_col] == x_val][COL_TPS].tolist()
 
         if individual_points:
+            # Find max value for this x position
+            max_tps = max(individual_points)
+            x_positions_max.append(x_val)
+            y_positions_max.append(max_tps)
             # Plot individual data points
-            x_positions = [x_val + x_offset] * len(individual_points)
+            x_positions = [x_val] * len(individual_points)
+            # Add label only for the first scatter to avoid duplicate legend entries
+            scatter_label = f'{version} (data)' if first_scatter else None
             ax.scatter(x_positions, individual_points, 
-                      color=color, s=SCATTER_SIZE, alpha=0.8, zorder=2, 
-                      edgecolors='black', linewidth=0.5)
+                      color=color, s=SCATTER_SIZE, alpha=ALPHA_VALUE, zorder=2, 
+                      edgecolors='black', linewidth=0.5, label=scatter_label)
+            first_scatter = False
 
-            # Draw range line if multiple points
-            if len(individual_points) > 1:
-                local_min = min(individual_points)
-                local_max = max(individual_points)
-                ax.plot([x_val + x_offset, x_val + x_offset], [local_min, local_max], 
-                       color=color, linewidth=1, alpha=0.7, zorder=1)
-
-            # Plot average marker
-            ax.scatter([x_val + x_offset], [avg_tps], 
-                      color=color, s=AVERAGE_MARKER_SIZE, marker='o', 
-                      edgecolor='white', linewidth=1, zorder=3)
-
-            # Add annotation
-            ax.annotate(f'{int(avg_tps)}', 
-                       xy=(x_val + x_offset, avg_tps),
+            # Add annotation showing max value
+            ax.annotate(f'{int(max_tps)}', 
+                       xy=(x_val, max_tps),
                        xytext=(0, 5), textcoords='offset points',
                        ha='center', va='bottom',
                        fontsize=ANNOTATION_FONT_SIZE, color=color,
                        bbox=dict(boxstyle='round,pad=0.3', 
                                facecolor='white', 
-                               edgecolor=color, 
-                               alpha=0.8))
+                               edgecolor=color))
 
-    # Connect averages with lines
-    if len(x_positions_avg) > 1:
-        ax.plot(x_positions_avg, y_positions_avg, 
-               color=color, linewidth=LINE_WIDTH, alpha=0.8, zorder=2, label=version)
+    # Connect max values with lines
+    if len(x_positions_max) > 1:
+        ax.plot(x_positions_max, y_positions_max, 
+               color=color, linewidth=LINE_WIDTH, zorder=2, label=f'{version} (max)')
     else:
         # For single point, just add label
-        ax.scatter([], [], color=color, s=AVERAGE_MARKER_SIZE, label=version)
+        ax.scatter([], [], color=color, s=SCATTER_SIZE, label=f'{version} (max)')
 
 def plot_performance_overview(df: pd.DataFrame, plot_type: str = "connections_equal_jobs"):
     """Create an overview plot showing all test types."""
@@ -212,7 +201,7 @@ def plot_performance_overview(df: pd.DataFrame, plot_type: str = "connections_eq
 
     # Create figure
     fig, axes = plt.subplots(*GRID_SHAPE, figsize=FIGURE_SIZE)
-    fig.suptitle(f'PostgreSQL Performance Overview - {config["title_suffix"]}', 
+    fig.suptitle(config["title_suffix"], 
                  fontsize=TITLE_FONT_SIZE, fontweight='bold')
 
     # Get x-axis column
@@ -244,7 +233,7 @@ def plot_performance_overview(df: pd.DataFrame, plot_type: str = "connections_eq
             # Configure axis
             ax.set_xlabel(config["x_label"])
             ax.set_ylabel('TPS')
-            ax.set_title(f'{test_type.replace("_", " ").title()}')
+            ax.set_title(f'$script = {test_type}.sql')
             ax.legend()
             ax.grid(True, alpha=0.3)
 
@@ -261,7 +250,8 @@ def plot_performance_overview(df: pd.DataFrame, plot_type: str = "connections_eq
     plt.tight_layout()
     plt.savefig(config["filename"], dpi=DPI, bbox_inches='tight')
     print(f"Saved plot: {config['filename']}")
-    plt.close()
+    # Keep the plot open for display
+    # plt.close()  # Commented out to keep plot open
 
 def get_sql_info(test_type: str) -> Tuple[Optional[str], Optional[str]]:
     """Read SQL file info for the corresponding test type."""
@@ -275,20 +265,20 @@ def get_sql_info(test_type: str) -> Tuple[Optional[str], Optional[str]]:
             return None, None
     return None, None
 
-def format_version_stats(version_stats: Dict, version: str, master_avg: float) -> str:
+def format_version_stats(version_stats: Dict, version: str, master_max: float) -> str:
     """Format version statistics for markdown output."""
     stats = version_stats[version]
-    avg_tps = stats['avg_tps']
+    max_tps = stats['max_tps']
     raw_values = stats['raw_values']
 
     if version == 'master':
         change_str = "(baseline)"
     else:
-        change_pct = ((avg_tps - master_avg) / master_avg) * 100
+        change_pct = ((max_tps - master_max) / master_max) * 100
         change_str = f"(+{change_pct:.1f}%)" if change_pct > 0 else f"({change_pct:.1f}%)"
 
     raw_str = "{" + ", ".join(f"{int(round(v))}" for v in raw_values) + "}"
-    return f"- **{version}**: {int(round(avg_tps))} TPS {change_str} `{raw_str}`\n"
+    return f"- **{version}**: {int(round(max_tps))} TPS {change_str} `{raw_str}`\n"
 
 def write_test_results(f, test_type: str, test_data: pd.DataFrame, x_col: str, category_name: str):
     """Write results for a single test type to the markdown file."""
@@ -318,9 +308,9 @@ def write_test_results(f, test_type: str, test_data: pd.DataFrame, x_col: str, c
         for version in x_data[COL_VERSION].unique():
             version_data = x_data[x_data[COL_VERSION] == version]
             tps_values = sorted(version_data[COL_TPS].tolist())
-            avg_tps = version_data[COL_TPS].mean()
+            max_tps = version_data[COL_TPS].max()
             version_stats[version] = {
-                'avg_tps': avg_tps,
+                'max_tps': max_tps,
                 'raw_values': tps_values
             }
 
@@ -329,11 +319,11 @@ def write_test_results(f, test_type: str, test_data: pd.DataFrame, x_col: str, c
             f.write("- No master baseline found for this configuration\n\n")
             continue
 
-        master_avg = version_stats['master']['avg_tps']
+        master_max = version_stats['master']['max_tps']
 
         # Write results for each version
         for version in sorted(version_stats.keys()):
-            f.write(format_version_stats(version_stats, version, master_avg))
+            f.write(format_version_stats(version_stats, version, master_max))
 
         f.write("\n")
 
@@ -387,6 +377,9 @@ def main():
     # Generate markdown results summary
     print_ascii_results(df)
     print(f"Markdown results summary saved to: {PERFORMANCE_MARKDOWN_FILE}")
+    
+    # Display all plots
+    plt.show()
 
 if __name__ == '__main__':
     main() 
