@@ -1,2 +1,0 @@
-test_type,clients,jobs,version,run_number,scaling_factor,num_clients,num_threads,duration,transactions_processed,failed_transactions,latency_avg,initial_connection_time,tps,transaction_type
-listen_notify_unique,16,16,optimize_listen_notify_v3,6,1,16,16,3,254264,0,0.189,4.233,84549.015279,listen_notify_unique.sql

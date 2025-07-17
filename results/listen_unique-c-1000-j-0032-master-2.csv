@@ -1,2 +1,0 @@
-test_type,clients,jobs,version,run_number,scaling_factor,num_clients,num_threads,duration,transactions_processed,failed_transactions,latency_avg,initial_connection_time,tps,transaction_type
-listen_unique,1000,32,master,2,1,1000,32,3,1605545,0,1.919,248.755,521220.937594,listen_unique.sql
