@@ -3,6 +3,10 @@ name = "pg-bench-listen-notify"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "pg-bench-listen-notify"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"

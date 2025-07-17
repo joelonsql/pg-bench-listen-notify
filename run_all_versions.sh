@@ -14,29 +14,44 @@ if [ -f "$OUTPUT_FILE" ]; then
     rm "$OUTPUT_FILE"
 fi
 
-# Define PostgreSQL versions from user's home directory
-declare -a PG_VERSIONS=(
-    "master"
-    "patch-v3"
+# Define PostgreSQL versions and their configurations
+declare -a CONFIGS=(
+    "master:default"
+    "patch-v4:1"
+    "patch-v4:8"
+    "patch-v4:16"
 )
 
-# Run benchmark for each version
-for version in "${PG_VERSIONS[@]}"; do
+# Run benchmark for each configuration
+for config in "${CONFIGS[@]}"; do
+    IFS=':' read -r version threshold <<< "$config"
     pg_path="$HOME/pg-${version}/bin"
 
     if [ -d "$pg_path" ]; then
         echo ""
         echo "=========================================="
-        echo "Testing PostgreSQL ${version} at: $pg_path"
+        if [ "$threshold" = "default" ]; then
+            echo "Testing PostgreSQL ${version} at: $pg_path"
+            version_name="${version}"
+        else
+            echo "Testing PostgreSQL ${version} (notify_multicast_threshold=${threshold}) at: $pg_path"
+            version_name="${version}-t${threshold}"
+        fi
         echo "=========================================="
 
-        # Use the version name without "pg-" prefix
-        ./target/release/pg-bench-listen-notify "$pg_path" "$OUTPUT_FILE" --version-name "${version}"
+        # Build command
+        if [ "$threshold" = "default" ]; then
+            # Master version - no threshold parameter
+            ./target/release/pg-bench-listen-notify "$pg_path" "$OUTPUT_FILE" --version-name "${version_name}"
+        else
+            # Patch version with threshold
+            ./target/release/pg-bench-listen-notify "$pg_path" "$OUTPUT_FILE" --version-name "${version_name}" --notify-multicast-threshold "${threshold}"
+        fi
 
         if [ $? -eq 0 ]; then
-            echo "✅ Benchmark completed for ${version}"
+            echo "✅ Benchmark completed for ${version_name}"
         else
-            echo "❌ Benchmark failed for ${version}"
+            echo "❌ Benchmark failed for ${version_name}"
         fi
     else
         echo "⚠️  Skipping ${version} (directory not found: $pg_path)"

@@ -15,7 +15,7 @@ if [ $? -eq 0 ]; then
     ./plot.sh
 
     echo ""
-    echo "✅ All done! Check plot.png for results"
+    echo "✅ All done! Check plot-v4.png for results"
 else
     echo "❌ Benchmark failed"
     exit 1

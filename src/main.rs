@@ -37,6 +37,7 @@ async fn find_free_port() -> Result<u16> {
 async fn setup_postgres(
     pg_bin_path: Option<&Path>,
     custom_version: Option<String>,
+    notify_multicast_threshold: Option<String>,
 ) -> Result<(TempDir, u16, String, String)> {
     // Build command paths
     let (initdb_cmd, pg_ctl_cmd, createdb_cmd) = if let Some(bin_path) = pg_bin_path {
@@ -117,14 +118,26 @@ autovacuum = off
     println!("Appended configuration to postgresql.conf");
 
     // Start PostgreSQL
+    let mut pg_ctl_args = vec![
+        "-D",
+        data_dir.to_str().unwrap(),
+        "-l",
+        "/tmp/pg.log",
+        "-o",
+    ];
+    
+    // Build the options string for postgres
+    let mut postgres_options = format!("-p {}", port);
+    if let Some(ref threshold) = notify_multicast_threshold {
+        postgres_options.push_str(&format!(" -c notify_multicast_threshold={}", threshold));
+        println!("Starting PostgreSQL with notify_multicast_threshold={}", threshold);
+    }
+    
+    pg_ctl_args.push(&postgres_options);
+    pg_ctl_args.push("start");
+    
     let output = Command::new(&pg_ctl_cmd)
-        .arg("-D")
-        .arg(&data_dir)
-        .arg("-l")
-        .arg("/tmp/pg.log")
-        .arg("-o")
-        .arg(format!("-p {}", port))
-        .arg("start")
+        .args(&pg_ctl_args)
         .output()?;
 
     if !output.status.success() {
@@ -370,6 +383,7 @@ async fn main() -> Result<()> {
     let mut pg_bin_path = None;
     let mut output_file = "stats.csv";
     let mut custom_version = None;
+    let mut notify_multicast_threshold = None;
 
     // Simple argument parsing
     let mut i = 1;
@@ -381,6 +395,14 @@ async fn main() -> Result<()> {
                     i += 2;
                 } else {
                     anyhow::bail!("--version-name requires a value");
+                }
+            }
+            "--notify-multicast-threshold" => {
+                if i + 1 < args.len() {
+                    notify_multicast_threshold = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    anyhow::bail!("--notify-multicast-threshold requires a value");
                 }
             }
             arg => {
@@ -400,6 +422,9 @@ async fn main() -> Result<()> {
     }
     if let Some(ref version) = custom_version {
         println!("Using custom version name: {}", version);
+    }
+    if let Some(ref threshold) = notify_multicast_threshold {
+        println!("Using notify_multicast_threshold: {}", threshold);
     }
 
     // Check and increase OS limits
@@ -478,7 +503,7 @@ async fn main() -> Result<()> {
             // Setup PostgreSQL for this test run
             println!("Setting up PostgreSQL for this test run...");
             let (temp_dir, port, connection_string, pg_version) =
-                setup_postgres(pg_bin_path, custom_version.clone()).await?;
+                setup_postgres(pg_bin_path, custom_version.clone(), notify_multicast_threshold.clone()).await?;
             let data_dir = temp_dir.path().join("data");
 
             println!("PostgreSQL started on port {}", port);

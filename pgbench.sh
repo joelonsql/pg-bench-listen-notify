@@ -3,8 +3,8 @@
 # Function to run benchmarks for all versions in randomized order
 run_benchmarks() {
     # Define version parameters
-    local versions=("master" "patch-v3")
-    local output_files=("master" "optimize_listen_notify_v3")
+    local versions=("master" "patch-v4")
+    local output_files=("master" "optimize_listen_notify_v4")
 
     # Define benchmark parameters
     local sql_scripts=(
@@ -18,6 +18,7 @@ run_benchmarks() {
 
     local runs=(0 1 2 3 4 5 6 7 8 9)
     local job_counts=(1 2 4 8 16 32)
+    local notify_multicast_threshold=(1 8 16)
 
     # Generate all combinations
     local combinations=()
@@ -32,7 +33,15 @@ run_benchmarks() {
                 for jobs in "${job_counts[@]}"; do
                     # Clients can be either equal to jobs or set to 1000
                     for clients in "$jobs" 1000; do
-                        combinations+=("$run|$i|$script|$jobs|$clients")
+                        # For master version, only use default threshold (no parameter)
+                        if [ "$version" = "master" ]; then
+                            combinations+=("$run|$i|$script|$jobs|$clients|default")
+                        else
+                            # For patch versions, iterate through all threshold values
+                            for threshold in "${notify_multicast_threshold[@]}"; do
+                                combinations+=("$run|$i|$script|$jobs|$clients|$threshold")
+                            done
+                        fi
                     done
                 done
             done
@@ -45,13 +54,13 @@ run_benchmarks() {
     echo "Generated ${#combinations[@]} total benchmark combinations"
     echo ""
     echo "Randomized execution order:"
-    echo "Format: run|version_index|script|jobs|clients"
+    echo "Format: run|version_index|script|jobs|clients|threshold"
     echo "----------------------------------------"
     local counter=1
     for combo in "${randomized_combinations[@]}"; do
-        IFS='|' read -r run version_index script jobs clients <<< "$combo"
+        IFS='|' read -r run version_index script jobs clients threshold <<< "$combo"
         local version="${versions[$version_index]}"
-        printf "%3d: %s|%s|%s|%s|%s\n" "$counter" "$run" "$version" "$script" "$jobs" "$clients"
+        printf "%3d: %s|%s|%s|%s|%s|%s\n" "$counter" "$run" "$version" "$script" "$jobs" "$clients" "$threshold"
         counter=$((counter + 1))
     done
     echo "----------------------------------------"
@@ -60,6 +69,7 @@ run_benchmarks() {
     
     # Execute each combination in random order
     local current_version=""
+    local current_threshold=""
     local current_pgdata=""
     local current_pg_ctl=""
     local port="54321"
@@ -67,7 +77,7 @@ run_benchmarks() {
     
     for combination in "${randomized_combinations[@]}"; do
         # Parse the combination
-        IFS='|' read -r run version_index script jobs clients <<< "$combination"
+        IFS='|' read -r run version_index script jobs clients threshold <<< "$combination"
         
         local version="${versions[$version_index]}"
         local output_file="${output_files[$version_index]}"
@@ -101,6 +111,27 @@ run_benchmarks() {
             current_version=""
         fi
         
+        # Also restart if threshold changed (for non-master versions)
+        if [ "$current_version" = "$version" ] && [ "$version" != "master" ] && [ "$current_threshold" != "$threshold" ]; then
+            echo "Threshold changed from $current_threshold to $threshold, restarting PostgreSQL..."
+            $current_pg_ctl -D "$current_pgdata" -o "-p $port" stop
+            if [ $? -ne 0 ]; then
+                echo "Error: pg_ctl stop failed for version $current_version"
+                exit 1
+            fi
+            
+            # Wait for the server to completely shut down
+            echo "Waiting for PostgreSQL to completely shut down..."
+            while lsof -i :$port -sTCP:LISTEN > /dev/null 2>&1; do
+                echo "Still waiting for port $port to be free..."
+                sleep 1
+            done
+            echo "PostgreSQL has completely shut down"
+            
+            current_version=""
+            current_threshold=""
+        fi
+            
         # Start PostgreSQL if not already running for this version
         if [ "$current_version" != "$version" ]; then
             echo "Starting PostgreSQL for version $version"
@@ -118,7 +149,14 @@ run_benchmarks() {
             sleep 1
 
             echo "Starting PostgreSQL server..."
-            $pg_ctl -D "$pgdata" -l /tmp/pg-$version.log -o "-p $port" start
+            # Build the options string
+            local pg_options="-p $port"
+            if [ "$version" != "master" ] && [ "$threshold" != "default" ]; then
+                pg_options="$pg_options -c notify_multicast_threshold=$threshold"
+                echo "Using notify_multicast_threshold=$threshold"
+            fi
+            
+            $pg_ctl -D "$pgdata" -l /tmp/pg-$version.log -o "$pg_options" start
             if [ $? -ne 0 ]; then
                 echo "Error: pg_ctl start failed for version $version"
                 echo "Log output:"
@@ -141,13 +179,22 @@ run_benchmarks() {
             current_version="$version"
             current_pgdata="$pgdata"
             current_pg_ctl="$pg_ctl"
+            current_threshold="$threshold"
         fi
         
         # Run the benchmark
         local script_name="${script%.sql}"  # Remove .sql extension
-        local output_path="results/${script_name}-c-$(printf "%04d" $clients)-j-$(printf "%04d" $jobs)-${output_file}-${run}.txt"
+        local output_path
+        if [ "$version" = "master" ]; then
+            output_path="results/${script_name}-c-$(printf "%04d" $clients)-j-$(printf "%04d" $jobs)-${output_file}-${run}.txt"
+        else
+            output_path="results/${script_name}-c-$(printf "%04d" $clients)-j-$(printf "%04d" $jobs)-t-$(printf "%04d" $threshold)-${output_file}-${run}.txt"
+        fi
 
         echo "Running version $version: $script with $clients clients and $jobs jobs (run $run)"
+        if [ "$version" != "master" ]; then
+            echo "  Using notify_multicast_threshold=$threshold"
+        fi
         caffeinate -dims $pgbench -p "$port" -d "$dbname" -f "$script" -c "$clients" -j "$jobs" -T 3 -n > "$output_path"
 
         # Check if the command failed

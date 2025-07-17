@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple, Optional
 
 # Constants
 COMBINED_CSV_FILE = 'pgbench_results_combined.csv'
-PERFORMANCE_MARKDOWN_FILE = 'performance_overview.md'
+PERFORMANCE_MARKDOWN_FILE = 'performance_overview-v4.md'
 FIXED_CONNECTIONS_COUNT = 1000
 DPI = 300
 
@@ -22,6 +22,7 @@ EXPECTED_COLUMNS = [
     'test_type',
     'clients', 
     'jobs',
+    'threshold',
     'version',
     'run_number',
     'scaling_factor',
@@ -40,6 +41,7 @@ EXPECTED_COLUMNS = [
 COL_TEST_TYPE = 'test_type'
 COL_CLIENTS = 'clients'
 COL_JOBS = 'jobs'
+COL_THRESHOLD = 'threshold'
 COL_VERSION = 'version'
 COL_TPS = 'tps'
 
@@ -47,12 +49,12 @@ COL_TPS = 'tps'
 PLOT_CONFIGS = {
     "connections_equal_jobs": {
         "title_suffix": "pgbench -f $script -c $jobs -j $jobs -T 3 -n",
-        "filename": "performance_overview_connections_equal_jobs.png",
+        "filename": "performance_overview_connections_equal_jobs-v4.png",
         "x_label": "$jobs"
     },
     "fixed_connections": {
         "title_suffix": f"pgbench -f \$script -c {FIXED_CONNECTIONS_COUNT} -j \$jobs -T 3 -n",
-        "filename": "performance_overview_fixed_connections.png",
+        "filename": "performance_overview_fixed_connections-v4.png",
         "x_label": "$jobs"
     }
 }
@@ -80,9 +82,15 @@ sns.set_palette("husl")
 
 def validate_dataframe(df: pd.DataFrame) -> None:
     """Validate that the dataframe has all expected columns."""
-    missing_columns = set(EXPECTED_COLUMNS) - set(df.columns)
+    # Make threshold optional for backward compatibility
+    required_columns = [col for col in EXPECTED_COLUMNS if col != 'threshold']
+    missing_columns = set(required_columns) - set(df.columns)
     if missing_columns:
         raise ValueError(f"Missing expected columns: {missing_columns}")
+    
+    # Add threshold column if missing (for backward compatibility)
+    if 'threshold' not in df.columns:
+        df['threshold'] = None
 
     # Validate data types
     numeric_columns = [COL_CLIENTS, COL_JOBS, COL_TPS]
@@ -137,15 +145,32 @@ def calculate_global_tps_bounds(df: pd.DataFrame, test_layout: List[List[str]]) 
 
     return min_tps * Y_AXIS_PADDING, max_tps * Y_AXIS_PADDING_MAX
 
-def plot_version_data(ax, version_data, test_data, version, color, x_col, version_index, num_versions):
-    """Plot data for a single version on the given axis."""
+def plot_version_data(ax, version_data, test_data, version, threshold, color, x_col, version_index, num_versions):
+    """Plot data for a single version+threshold combination on the given axis."""
     version_data = version_data.sort_values(x_col)
-    individual_data = test_data[test_data[COL_VERSION] == version].copy()
+    # Filter individual data by both version and threshold
+    # Handle NaN values properly for master version
+    if pd.isna(threshold):
+        individual_data = test_data[
+            (test_data[COL_VERSION] == version) & 
+            (test_data[COL_THRESHOLD].isna())
+        ].copy()
+    else:
+        individual_data = test_data[
+            (test_data[COL_VERSION] == version) & 
+            (test_data[COL_THRESHOLD] == threshold)
+        ].copy()
     individual_data = individual_data.sort_values(x_col)
 
     x_positions_max = []
     y_positions_max = []
     first_scatter = True  # Flag to add label only once
+    
+    # Create label with threshold info
+    if not pd.isna(threshold) and version != 'master':
+        label_suffix = f" (t={int(threshold)})"
+    else:
+        label_suffix = ""
 
     for _, row in version_data.iterrows():
         x_val = row[x_col]
@@ -153,7 +178,7 @@ def plot_version_data(ax, version_data, test_data, version, color, x_col, versio
 
         # Get individual points
         individual_points = individual_data[individual_data[x_col] == x_val][COL_TPS].tolist()
-
+        
         if individual_points:
             # Find max value for this x position
             max_tps = max(individual_points)
@@ -162,7 +187,7 @@ def plot_version_data(ax, version_data, test_data, version, color, x_col, versio
             # Plot individual data points
             x_positions = [x_val] * len(individual_points)
             # Add label only for the first scatter to avoid duplicate legend entries
-            scatter_label = f'{version} (data)' if first_scatter else None
+            scatter_label = f'{version}{label_suffix} (data)' if first_scatter else None
             ax.scatter(x_positions, individual_points, 
                       color=color, s=SCATTER_SIZE, alpha=ALPHA_VALUE, zorder=2, 
                       edgecolors='black', linewidth=0.5, label=scatter_label)
@@ -180,11 +205,18 @@ def plot_version_data(ax, version_data, test_data, version, color, x_col, versio
 
     # Connect max values with lines
     if len(x_positions_max) > 1:
-        ax.plot(x_positions_max, y_positions_max, 
-               color=color, linewidth=LINE_WIDTH, zorder=2, label=f'{version} (max)')
+        # Make master line more prominent
+        if version == 'master':
+            ax.plot(x_positions_max, y_positions_max, 
+                   color=color, linewidth=LINE_WIDTH * 1.5, zorder=10, 
+                   label=f'{version}{label_suffix} (max)', linestyle='-', alpha=1.0)
+        else:
+            ax.plot(x_positions_max, y_positions_max, 
+                   color=color, linewidth=LINE_WIDTH, zorder=5, 
+                   label=f'{version}{label_suffix} (max)', linestyle='-', alpha=0.9)
     else:
         # For single point, just add label
-        ax.scatter([], [], color=color, s=SCATTER_SIZE, label=f'{version} (max)')
+        ax.scatter([], [], color=color, s=SCATTER_SIZE, label=f'{version}{label_suffix} (max)')
 
 def plot_performance_overview(df: pd.DataFrame, plot_type: str = "connections_equal_jobs"):
     """Create an overview plot showing all test types."""
@@ -219,16 +251,34 @@ def plot_performance_overview(df: pd.DataFrame, plot_type: str = "connections_eq
                 ax.set_visible(False)
                 continue
 
-            # Group by version and x-axis variable
-            grouped = test_data.groupby([COL_VERSION, x_col])[COL_TPS].mean().reset_index()
-            versions = grouped[COL_VERSION].unique()
-            colors = plt.cm.Set1(np.linspace(0, 1, len(versions)))
+            # Group by version, threshold, and x-axis variable
+            # Use dropna=False to keep None values for master version
+            grouped = test_data.groupby([COL_VERSION, COL_THRESHOLD, x_col], dropna=False)[COL_TPS].mean().reset_index()
+            
+            # Get unique version+threshold combinations
+            version_threshold_combos = grouped[[COL_VERSION, COL_THRESHOLD]].drop_duplicates()
+            num_combos = len(version_threshold_combos)
+            colors = plt.cm.Set1(np.linspace(0, 1, num_combos))
 
-            # Plot each version
-            for j, version in enumerate(versions):
-                version_data = grouped[grouped[COL_VERSION] == version]
-                plot_version_data(ax, version_data, test_data, version, colors[j], 
-                                x_col, j, len(versions))
+            # Plot each version+threshold combination
+            for j, (_, combo) in enumerate(version_threshold_combos.iterrows()):
+                version = combo[COL_VERSION]
+                threshold = combo[COL_THRESHOLD]
+                
+                # Filter data for this specific combination
+                if pd.isna(threshold):
+                    combo_data = grouped[
+                        (grouped[COL_VERSION] == version) & 
+                        (grouped[COL_THRESHOLD].isna())
+                    ]
+                else:
+                    combo_data = grouped[
+                        (grouped[COL_VERSION] == version) & 
+                        (grouped[COL_THRESHOLD] == threshold)
+                    ]
+                
+                plot_version_data(ax, combo_data, test_data, version, threshold, colors[j], 
+                                x_col, j, num_combos)
 
             # Configure axis
             ax.set_xlabel(config["x_label"])
@@ -265,11 +315,18 @@ def get_sql_info(test_type: str) -> Tuple[Optional[str], Optional[str]]:
             return None, None
     return None, None
 
-def format_version_stats(version_stats: Dict, version: str, master_max: float) -> str:
+def format_version_stats(version_stats: Dict, key: Tuple[str, any], master_max: float) -> str:
     """Format version statistics for markdown output."""
-    stats = version_stats[version]
+    version, threshold = key
+    stats = version_stats[key]
     max_tps = stats['max_tps']
     raw_values = stats['raw_values']
+    
+    # Create version label with threshold
+    if threshold is not None and version != 'master':
+        version_label = f"{version} (t={threshold})"
+    else:
+        version_label = version
 
     if version == 'master':
         change_str = "(baseline)"
@@ -278,7 +335,7 @@ def format_version_stats(version_stats: Dict, version: str, master_max: float) -
         change_str = f"(+{change_pct:.1f}%)" if change_pct > 0 else f"({change_pct:.1f}%)"
 
     raw_str = "{" + ", ".join(f"{int(round(v))}" for v in raw_values) + "}"
-    return f"- **{version}**: {int(round(max_tps))} TPS {change_str} `{raw_str}`\n"
+    return f"- **{version_label}**: {int(round(max_tps))} TPS {change_str} `{raw_str}`\n"
 
 def write_test_results(f, test_type: str, test_data: pd.DataFrame, x_col: str, category_name: str):
     """Write results for a single test type to the markdown file."""
@@ -306,24 +363,44 @@ def write_test_results(f, test_type: str, test_data: pd.DataFrame, x_col: str, c
         # Calculate version statistics
         version_stats = {}
         for version in x_data[COL_VERSION].unique():
-            version_data = x_data[x_data[COL_VERSION] == version]
-            tps_values = sorted(version_data[COL_TPS].tolist())
-            max_tps = version_data[COL_TPS].max()
-            version_stats[version] = {
-                'max_tps': max_tps,
-                'raw_values': tps_values
-            }
+            # Get unique thresholds for this version
+            version_thresholds = x_data[x_data[COL_VERSION] == version][COL_THRESHOLD].unique()
+            for threshold in version_thresholds:
+                # Handle None/NaN values properly
+                if pd.isna(threshold):
+                    version_data = x_data[
+                        (x_data[COL_VERSION] == version) & 
+                        (x_data[COL_THRESHOLD].isna())
+                    ]
+                else:
+                    version_data = x_data[
+                        (x_data[COL_VERSION] == version) & 
+                        (x_data[COL_THRESHOLD] == threshold)
+                    ]
+                if not version_data.empty:
+                    tps_values = sorted(version_data[COL_TPS].tolist())
+                    max_tps = version_data[COL_TPS].max()
+                    version_stats[(version, threshold)] = {
+                        'max_tps': max_tps,
+                        'raw_values': tps_values
+                    }
 
         # Check for master baseline
-        if 'master' not in version_stats:
+        master_key = None
+        for key in version_stats.keys():
+            if key[0] == 'master':
+                master_key = key
+                break
+                
+        if master_key is None:
             f.write("- No master baseline found for this configuration\n\n")
             continue
 
-        master_max = version_stats['master']['max_tps']
+        master_max = version_stats[master_key]['max_tps']
 
         # Write results for each version
-        for version in sorted(version_stats.keys()):
-            f.write(format_version_stats(version_stats, version, master_max))
+        for key in sorted(version_stats.keys()):
+            f.write(format_version_stats(version_stats, key, master_max))
 
         f.write("\n")
 
